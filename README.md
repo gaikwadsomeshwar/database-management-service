@@ -66,6 +66,28 @@ Never commit `.env` or `k8s/secret.yaml` with real credentials.
 | `JWT_ACCESS_TOKEN_EXPIRES_MINUTES` | API              | Lifetime of issued access tokens.                                                                    |
 | `API_HOST` / `API_PORT`            | API              | Flask bind address and listening port.                                                               |
 
+## Prometheus metrics
+
+The API exposes Prometheus-compatible metrics at:
+
+```text
+http://localhost:5000/metrics
+```
+
+The metrics include:
+
+- `student_api_requests_total` — request count labeled by HTTP method, endpoint, and status code.
+- `student_api_response_duration_seconds` — response-time histogram labeled by HTTP method and endpoint.
+
+Prometheus can scrape the endpoint with:
+
+```yaml
+scrape_configs:
+  - job_name: student-api
+    static_configs:
+      - targets: ["localhost:5000"]
+```
+
 # Option 1: Run with Docker
 
 This option uses two containers connected to a shared Docker network:
@@ -104,6 +126,11 @@ docker run -d --name student-mysql --network student-network `
   mysql:lts-oracle
 ```
 
+The named volume is the database's persistent storage. Existing state tables
+and rows are not stored in the application image; they are stored in
+`student-mysql-data`. Keep using the same volume and do not run
+`docker volume rm student-mysql-data` if existing data must be preserved.
+
 Use the same password as `MYSQL_PASSWORD` in `.env`. `MYSQL_PASSWORD` is used
 by the application to connect as `MYSQL_USER`; for the current setup that user
 is `root`, so the application receives the root password through its own
@@ -134,6 +161,10 @@ connection and seeds a different state table. Increase `--workers` or set
 `STUDENT_SEED_WORKERS` only when the MySQL server has enough CPU, memory, and
 connections. `--batch-size` controls rows per insert batch independently.
 
+Seeding is additive. Existing state tables are preserved, and existing rows
+are counted before insertion. If a table already has the target number of
+records, it is skipped; if it has fewer, only the missing records are added.
+
 ## 5. Start the API container
 
 ```powershell
@@ -154,6 +185,11 @@ The Docker API is available at `http://localhost:5000`.
 ```powershell
 docker rm -f student-api student-mysql
 docker network rm student-network
+```
+
+Only remove the volume when intentionally deleting all database data:
+
+```powershell
 docker volume rm student-mysql-data
 ```
 

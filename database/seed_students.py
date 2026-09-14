@@ -119,14 +119,13 @@ def build_student(fake):
 
 def create_state_table(connection, table_name):
     """Create one isolated student table for an Indian state."""
-    connection.exec_driver_sql(f"DROP TABLE IF EXISTS `{table_name}`")
     connection.exec_driver_sql(
-        f"CREATE TABLE `{table_name}` ({STUDENT_COLUMNS}) ENGINE=InnoDB"
+        f"CREATE TABLE IF NOT EXISTS `{table_name}` ({STUDENT_COLUMNS}) ENGINE=InnoDB"
     )
 
 
 def seed_state(connection, table_name, state_name, count, batch_size, seed):
-    """Create and populate one state's table with deterministic fake data."""
+    """Add only missing rows until one state's target count is reached."""
     fake = Faker("en_IN")
     fake.seed_instance(seed)
     insert_student = text(
@@ -141,10 +140,26 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
         """
     )
     create_state_table(connection, table_name)
+    existing_count = connection.execute(
+        text(f"SELECT COUNT(*) FROM `{table_name}`")
+    ).scalar_one()
+    missing_count = max(0, count - existing_count)
 
-    for start in range(0, count, batch_size):
+    if missing_count == 0:
+        logger.info(
+            "%s: already has %d/%d records; no insert required",
+            state_name,
+            existing_count,
+            count,
+        )
+        return 0
+
+    for start in range(0, missing_count, batch_size):
         batch = []
-        for index in range(start + 1, min(start + batch_size, count) + 1):
+        for index in range(
+            existing_count + start + 1,
+            existing_count + min(start + batch_size, missing_count) + 1,
+        ):
             student = build_student(fake)
             student["state"] = state_name
             student["email"] = (
@@ -156,9 +171,10 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
         logger.info(
             "%s: inserted %d/%d student records",
             state_name,
-            min(start + batch_size, count),
+            existing_count + min(start + batch_size, missing_count),
             count,
         )
+    return missing_count
 
 
 def seed_one_state(engine, table_name, state_name, count, batch_size, seed):
@@ -169,7 +185,7 @@ def seed_one_state(engine, table_name, state_name, count, batch_size, seed):
 
 
 def seed_students(batch_size, seed, workers):
-    """Rebuild all state tables concurrently with bounded worker parallelism."""
+    """Add missing records to all state tables concurrently."""
     engine = create_engine(
         load_database_url(),
         pool_pre_ping=True,
@@ -181,7 +197,6 @@ def seed_students(batch_size, seed, workers):
     try:
         # Metadata is written first so workers only perform independent table work.
         with engine.begin() as connection:
-            connection.execute(text("DELETE FROM state_metadata"))
             for table_name, (state_name, population) in STATE_POPULATIONS.items():
                 count = STATE_STUDENT_COUNTS[table_name]
                 connection.execute(
@@ -189,7 +204,12 @@ def seed_students(batch_size, seed, workers):
                         "INSERT INTO state_metadata "
                         "(state_code, state_name, census_2011_population, "
                         "assumed_student_ratio, allocated_student_count) VALUES "
-                        "(:code, :name, :population, :ratio, :count)"
+                        "(:code, :name, :population, :ratio, :count) "
+                        "ON DUPLICATE KEY UPDATE "
+                        "state_name = VALUES(state_name), "
+                        "census_2011_population = VALUES(census_2011_population), "
+                        "assumed_student_ratio = VALUES(assumed_student_ratio), "
+                        "allocated_student_count = VALUES(allocated_student_count)"
                     ),
                     {
                         "code": table_name,

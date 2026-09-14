@@ -7,3 +7,4 @@ Flask
 Flask-RESTful
 Flask-JWT-Extended
 flask-swagger-ui
+prometheus-client

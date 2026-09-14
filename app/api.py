@@ -2,6 +2,7 @@
 
 import logging
 import os
+import time
 from functools import wraps
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -21,6 +22,7 @@ from flask_jwt_extended.exceptions import (
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 from flask_restful import Api, Resource
 from flask_swagger_ui import get_swaggerui_blueprint
+from prometheus_client import Counter, Histogram, generate_latest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -36,6 +38,17 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+API_REQUESTS = Counter(
+    "student_api_requests_total",
+    "Total HTTP requests received by the student API.",
+    ("method", "endpoint", "status"),
+)
+API_RESPONSE_TIME = Histogram(
+    "student_api_response_duration_seconds",
+    "HTTP response time for the student API.",
+    ("method", "endpoint"),
+)
+
 app = Flask(__name__)
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
 if not app.config["JWT_SECRET_KEY"]:
@@ -47,6 +60,23 @@ app.config["JWT_ACCESS_TOKEN_EXPIRES"] = int(
 # Register JWT validation and token creation with the Flask application.
 JWTManager(app)
 api = Api(app)
+
+
+@app.before_request
+def start_request_metrics():
+    """Start the timer used by the request response-time histogram."""
+    request.environ["student_api_request_started"] = time.perf_counter()
+
+
+@app.after_request
+def record_request_metrics(response):
+    """Record method, route, status code, and response duration for requests."""
+    started = request.environ.get("student_api_request_started")
+    duration = time.perf_counter() - started if started else 0
+    endpoint = request.url_rule.rule if request.url_rule else request.path
+    API_REQUESTS.labels(request.method, endpoint, str(response.status_code)).inc()
+    API_RESPONSE_TIME.labels(request.method, endpoint).observe(duration)
+    return response
 
 
 
@@ -341,6 +371,12 @@ def swagger_spec():
     return jsonify(SWAGGER_SPEC)
 
 
+@app.get("/metrics")
+def metrics():
+    """Expose Prometheus metrics for scraping."""
+    return generate_latest(), 200, {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"}
+
+
 @app.get("/health")
 def health():
     """Return API and database availability without requiring authentication."""
@@ -375,6 +411,12 @@ SWAGGER_SPEC = {
             "get": {
                 "summary": "Check API/database health",
                 "responses": {"200": {"description": "Healthy"}},
+            }
+        },
+        "/metrics": {
+            "get": {
+                "summary": "Expose Prometheus metrics",
+                "responses": {"200": {"description": "Prometheus text format metrics"}},
             }
         },
         "/api/auth/login": {
