@@ -59,6 +59,7 @@ Never commit `.env` or `k8s/secret.yaml` with real credentials.
 | `MYSQL_USER`                       | API/seeder       | MySQL account used by the application.                                                               |
 | `MYSQL_PASSWORD`                   | API/seeder       | Password for `MYSQL_USER`; the MySQL container receives it as `MYSQL_ROOT_PASSWORD` when using root. |
 | `STUDENT_BATCH_SIZE`               | Seeder           | Number of records inserted per transaction batch.                                                    |
+| `STUDENT_SEED_WORKERS`             | Seeder           | Number of state tables seeded concurrently; default is `4`.                                          |
 | `API_USERNAME`                     | API              | Login username for JWT issuance.                                                                     |
 | `API_PASSWORD`                     | API              | Login password for JWT issuance.                                                                     |
 | `JWT_SECRET_KEY`                   | API              | Private signing key; never send it as a bearer token.                                                |
@@ -125,8 +126,13 @@ docker run --rm --name student-seeder --network student-network `
   -e MYSQL_USER=root `
   -e MYSQL_PASSWORD=your-mysql-password `
   student-api:1.0.0 `
-  sh -c "python main.py /database/init/01_students_schema.sql && python /database/seed_students.py"
+  sh -c "python main.py /database/init/01_students_schema.sql && python /database/seed_students.py --workers 4"
 ```
+
+The seeder uses bounded parallelism: each worker owns its own SQLAlchemy
+connection and seeds a different state table. Increase `--workers` or set
+`STUDENT_SEED_WORKERS` only when the MySQL server has enough CPU, memory, and
+connections. `--batch-size` controls rows per insert batch independently.
 
 ## 5. Start the API container
 

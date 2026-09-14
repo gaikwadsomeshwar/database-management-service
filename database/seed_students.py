@@ -1,6 +1,7 @@
 """Generate and insert synthetic student records into MySQL."""
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import os
 import sys
@@ -160,12 +161,25 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
         )
 
 
-def seed_students(batch_size, seed):
-    """Rebuild every Indian state table using proportional allocations."""
-    engine = create_engine(load_database_url())
+def seed_one_state(engine, table_name, state_name, count, batch_size, seed):
+    """Seed one state using an independent connection for thread safety."""
+    with engine.begin() as connection:
+        seed_state(connection, table_name, state_name, count, batch_size, seed)
+    return table_name, count
+
+
+def seed_students(batch_size, seed, workers):
+    """Rebuild all state tables concurrently with bounded worker parallelism."""
+    engine = create_engine(
+        load_database_url(),
+        pool_pre_ping=True,
+        pool_size=workers,
+        max_overflow=0,
+    )
     wait_for_database(engine)
 
     try:
+        # Metadata is written first so workers only perform independent table work.
         with engine.begin() as connection:
             connection.execute(text("DELETE FROM state_metadata"))
             for table_name, (state_name, population) in STATE_POPULATIONS.items():
@@ -185,14 +199,34 @@ def seed_students(batch_size, seed):
                         "count": count,
                     },
                 )
-                seed_state(
-                    connection,
+
+        executor = ThreadPoolExecutor(max_workers=workers)
+        try:
+            jobs = [
+                executor.submit(
+                    seed_one_state,
+                    engine,
                     f"student_{table_name}",
                     state_name,
-                    count,
+                    STATE_STUDENT_COUNTS[table_name],
                     batch_size,
                     seed,
                 )
+                for table_name, (state_name, _) in STATE_POPULATIONS.items()
+            ]
+            completed = 0
+            for future in as_completed(jobs):
+                table_name, count = future.result()
+                completed += 1
+                logger.info(
+                    "Completed state table %s (%d records); %d/%d states finished",
+                    table_name,
+                    count,
+                    completed,
+                    len(STATE_POPULATIONS),
+                )
+        finally:
+            executor.shutdown(wait=True, cancel_futures=True)
     except SQLAlchemyError:
         logger.exception("Failed to seed student records")
         raise
@@ -220,13 +254,21 @@ def main():
         default=int(os.getenv("STUDENT_RANDOM_SEED", "20260914")),
         help="Random seed for reproducible data (default: 20260914).",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=int(os.getenv("STUDENT_SEED_WORKERS", "4")),
+        help="Concurrent state-table workers (default: 4).",
+    )
     args = parser.parse_args()
 
     if args.batch_size < 1:
         parser.error("--batch-size must be greater than zero")
+    if args.workers < 1:
+        parser.error("--workers must be greater than zero")
 
     try:
-        seed_students(args.batch_size, args.seed)
+        seed_students(args.batch_size, args.seed, args.workers)
     except (OSError, ValueError, SQLAlchemyError):
         logger.exception("Student data generation failed")
         return 1
