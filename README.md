@@ -157,7 +157,9 @@ docker run --rm --name student-seeder --network student-network `
 ```
 
 The seeder uses bounded parallelism: each worker owns its own SQLAlchemy
-connection and seeds a different state table. Increase `--workers` or set
+connection and performs that state's metadata upsert, table creation, row
+count, excess deletion, and missing-row insertion. Different state tables are
+processed concurrently. Increase `--workers` or set
 `STUDENT_SEED_WORKERS` only when the MySQL server has enough CPU, memory, and
 connections. `--batch-size` controls rows per insert batch independently.
 

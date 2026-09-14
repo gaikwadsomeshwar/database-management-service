@@ -170,7 +170,7 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
             existing_count,
             count,
         )
-        return excess_count
+        return {"deleted": excess_count, "inserted": 0}
 
     fake = Faker("en_IN")
     fake.seed_instance(seed)
@@ -195,14 +195,53 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
             existing_count + min(start + batch_size, missing_count),
             count,
         )
-    return missing_count
+    return {"deleted": excess_count, "inserted": missing_count}
 
 
-def seed_one_state(engine, table_name, state_name, count, batch_size, seed):
-    """Seed one state using an independent connection for thread safety."""
+def seed_one_state(
+    engine,
+    table_name,
+    state_name,
+    population,
+    count,
+    batch_size,
+    seed,
+):
+    """Run metadata, DDL, reconciliation, and inserts for one state.
+
+    Every state owns an independent connection and transaction, allowing all
+    state operations to run concurrently without sharing connections.
+    """
     with engine.begin() as connection:
-        seed_state(connection, table_name, state_name, count, batch_size, seed)
-    return table_name, count
+        connection.execute(
+            text(
+                "INSERT INTO state_metadata "
+                "(state_code, state_name, census_2011_population, "
+                "assumed_student_ratio, allocated_student_count) VALUES "
+                "(:code, :name, :population, :ratio, :count) "
+                "ON DUPLICATE KEY UPDATE "
+                "state_name = VALUES(state_name), "
+                "census_2011_population = VALUES(census_2011_population), "
+                "assumed_student_ratio = VALUES(assumed_student_ratio), "
+                "allocated_student_count = VALUES(allocated_student_count)"
+            ),
+            {
+                "code": table_name.removeprefix("student_"),
+                "name": state_name,
+                "population": population,
+                "ratio": STUDENT_POPULATION_RATIO,
+                "count": count,
+            },
+        )
+        changes = seed_state(
+            connection,
+            table_name,
+            state_name,
+            count,
+            batch_size,
+            seed,
+        )
+    return table_name, count, changes
 
 
 def seed_students(batch_size, seed, workers):
@@ -216,31 +255,6 @@ def seed_students(batch_size, seed, workers):
     wait_for_database(engine)
 
     try:
-        # Metadata is written first so workers only perform independent table work.
-        with engine.begin() as connection:
-            for table_name, (state_name, population) in STATE_POPULATIONS.items():
-                count = STATE_STUDENT_COUNTS[table_name]
-                connection.execute(
-                    text(
-                        "INSERT INTO state_metadata "
-                        "(state_code, state_name, census_2011_population, "
-                        "assumed_student_ratio, allocated_student_count) VALUES "
-                        "(:code, :name, :population, :ratio, :count) "
-                        "ON DUPLICATE KEY UPDATE "
-                        "state_name = VALUES(state_name), "
-                        "census_2011_population = VALUES(census_2011_population), "
-                        "assumed_student_ratio = VALUES(assumed_student_ratio), "
-                        "allocated_student_count = VALUES(allocated_student_count)"
-                    ),
-                    {
-                        "code": table_name,
-                        "name": state_name,
-                        "population": population,
-                        "ratio": STUDENT_POPULATION_RATIO,
-                        "count": count,
-                    },
-                )
-
         executor = ThreadPoolExecutor(max_workers=workers)
         try:
             jobs = [
@@ -249,15 +263,16 @@ def seed_students(batch_size, seed, workers):
                     engine,
                     f"student_{table_name}",
                     state_name,
+                    population,
                     STATE_STUDENT_COUNTS[table_name],
                     batch_size,
                     seed,
                 )
-                for table_name, (state_name, _) in STATE_POPULATIONS.items()
+                for table_name, (state_name, population) in STATE_POPULATIONS.items()
             ]
             completed = 0
             for future in as_completed(jobs):
-                table_name, count = future.result()
+                table_name, count, changes = future.result()
                 completed += 1
                 logger.info(
                     "Completed state table %s (%d records); %d/%d states finished",
@@ -265,6 +280,12 @@ def seed_students(batch_size, seed, workers):
                     count,
                     completed,
                     len(STATE_POPULATIONS),
+                )
+                logger.info(
+                    "%s changes: inserted=%d deleted=%d",
+                    table_name,
+                    changes["inserted"],
+                    changes["deleted"],
                 )
         finally:
             executor.shutdown(wait=True, cancel_futures=True)
