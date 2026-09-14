@@ -18,15 +18,17 @@ from flask_jwt_extended.exceptions import (
     JWTDecodeError,
     NoAuthorizationError,
 )
-from jwt.exceptions import ExpiredSignatureError
+from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 from flask_restful import Api, Resource
 from flask_swagger_ui import get_swaggerui_blueprint
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
+
+from state_populations import STATE_POPULATIONS  # noqa: E402
+from sql_executor import execute_sql_script  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -42,7 +44,8 @@ if not app.config["JWT_SECRET_KEY"]:
 app.config["JWT_ACCESS_TOKEN_EXPIRES"] = int(
     os.getenv("JWT_ACCESS_TOKEN_EXPIRES_MINUTES", "60")
 ) * 60
-jwt = JWTManager(app)
+# Register JWT validation and token creation with the Flask application.
+JWTManager(app)
 api = Api(app)
 
 
@@ -53,10 +56,15 @@ def jwt_required_json(function):
     def wrapped(*args, **kwargs):
         try:
             verify_jwt_in_request()
-        except (NoAuthorizationError, InvalidHeaderError, JWTDecodeError):
-            return {"message": "A valid Bearer JWT is required"}, 401
         except ExpiredSignatureError:
             return {"message": "JWT has expired"}, 401
+        except (
+            NoAuthorizationError,
+            InvalidHeaderError,
+            JWTDecodeError,
+            InvalidTokenError,
+        ):
+            return {"message": "A valid Bearer JWT is required"}, 401
         return function(*args, **kwargs)
 
     return wrapped
@@ -98,6 +106,7 @@ def load_database_url():
 engine = create_engine(load_database_url(), pool_pre_ping=True)
 
 
+# Columns returned by every state table and exposed by the API.
 STUDENT_FIELDS = (
     "student_id",
     "first_name",
@@ -107,11 +116,40 @@ STUDENT_FIELDS = (
     "phone_number",
     "city",
     "state",
-    "country",
     "enrollment_date",
     "created_at",
 )
+# Only these columns may be used in ORDER BY to prevent SQL injection.
 SORT_FIELDS = set(STUDENT_FIELDS)
+SELECT_STUDENT_FIELDS = "SELECT " + ", ".join(STUDENT_FIELDS)
+JWT_ERROR_DESCRIPTION = "Missing or invalid JWT"
+# Map public state codes to fixed table names; only this allow-list is queried.
+STATE_TABLES = {
+    state_code: f"student_{state_code}"
+    for state_code in STATE_POPULATIONS
+}
+
+
+def state_table(state_code):
+    """Resolve a safe state code to its generated table name."""
+    if state_code is None:
+        return None
+    return STATE_TABLES.get(state_code.strip().lower())
+
+
+def students_source(selected_state=None):
+    """Build a safe table source for one state or all state tables."""
+    table = state_table(selected_state)
+    if table:
+        return f"`{table}`"
+    if selected_state:
+        raise ValueError("Unsupported state")
+
+    queries = [
+        SELECT_STUDENT_FIELDS + f" FROM `{table_name}`"
+        for table_name in STATE_TABLES.values()
+    ]
+    return "(" + " UNION ALL ".join(queries) + ") AS students"
 
 
 def serialize_student(row):
@@ -151,9 +189,9 @@ class LoginResource(Resource):
 class StudentListResource(Resource):
     """Return a paginated, filtered, and sorted student collection.
 
-    Supported filters are `first_name`, `last_name`, `email`, `city`, `state`,
-    and `country`; each performs a case-insensitive partial match. Use `sort_by`
-    with an allowed field and `sort_order=asc|desc` for ordering.
+    Use the `state` query parameter with a state code such as `maharashtra` to
+    query one state table, or omit it to query all state tables. Other filters
+    are `first_name`, `last_name`, `email`, and `city`.
     """
 
     @jwt_required_json
@@ -161,6 +199,7 @@ class StudentListResource(Resource):
         try:
             page = request.args.get("page", 1, type=int)
             per_page = request.args.get("per_page", 50, type=int)
+            selected_state = request.args.get("state")
             sort_by = request.args.get("sort_by", "student_id")
             sort_order = request.args.get("sort_order", "asc").lower()
 
@@ -170,6 +209,10 @@ class StudentListResource(Resource):
                 return {"message": f"Unsupported sort_by: {sort_by}"}, 400
             if sort_order not in {"asc", "desc"}:
                 return {"message": "sort_order must be asc or desc"}, 400
+            try:
+                source = students_source(selected_state)
+            except ValueError:
+                return {"message": f"Unsupported state: {selected_state}"}, 400
 
             conditions = []
             parameters = {}
@@ -178,8 +221,6 @@ class StudentListResource(Resource):
                 "last_name",
                 "email",
                 "city",
-                "state",
-                "country",
             )
             for field in filter_fields:
                 value = request.args.get(field)
@@ -192,11 +233,10 @@ class StudentListResource(Resource):
             parameters.update({"limit": per_page, "offset": offset})
             order = "DESC" if sort_order == "desc" else "ASC"
 
-            count_query = text(f"SELECT COUNT(*) FROM students {where_clause}")
+            count_query = text(f"SELECT COUNT(*) FROM {source} {where_clause}")
             data_query = text(
-                "SELECT "
-                + ", ".join(STUDENT_FIELDS)
-                + f" FROM students {where_clause} ORDER BY {sort_by} {order} "
+                SELECT_STUDENT_FIELDS
+                + f" FROM {source} {where_clause} ORDER BY {sort_by} {order} "
                 "LIMIT :limit OFFSET :offset"
             )
 
@@ -219,17 +259,23 @@ class StudentListResource(Resource):
 
 
 class StudentResource(Resource):
-    """Return one student by numeric ID."""
+    """Return one student by numeric ID from a selected state table."""
 
     @jwt_required_json
     def get(self, student_id):
+        selected_state = request.args.get("state")
+        try:
+            source = students_source(selected_state)
+        except ValueError:
+            return {"message": f"Unsupported state: {selected_state}"}, 400
+        if not selected_state:
+            return {"message": "state query parameter is required"}, 400
         try:
             with engine.connect() as connection:
                 row = connection.execute(
                     text(
-                        "SELECT "
-                        + ", ".join(STUDENT_FIELDS)
-                        + " FROM students WHERE student_id = :student_id"
+                        SELECT_STUDENT_FIELDS
+                        + f" FROM {source} WHERE student_id = :student_id"
                     ),
                     {"student_id": student_id},
                 ).fetchone()
@@ -241,9 +287,52 @@ class StudentResource(Resource):
             return {"message": "Database query failed"}, 503
 
 
+class SqlExecutionResource(Resource):
+    """Execute a safe SQL script against a database selected by the request.
+
+    JSON body: ``database``, ``sql``, optional ``rollback`` and ``rollback_sql``.
+    DROP and DELETE are always rejected. ALTER TABLE operations are serialized
+    per table by the executor and return start/end timestamps and duration.
+    """
+
+    @jwt_required_json
+    def post(self):
+        payload = request.get_json(silent=True) or {}
+        database = payload.get("database")
+        sql_content = payload.get("sql")
+        rollback = payload.get("rollback", False)
+        rollback_sql = payload.get("rollback_sql")
+
+        if not isinstance(database, str) or not database.strip():
+            return {"message": "database is required"}, 400
+        if not isinstance(sql_content, str) or not sql_content.strip():
+            return {"message": "sql is required"}, 400
+        if not isinstance(rollback, bool):
+            return {"message": "rollback must be boolean"}, 400
+
+        try:
+            result = execute_sql_script(
+                database=database.strip(),
+                sql_content=sql_content,
+                rollback=rollback,
+                rollback_sql=rollback_sql,
+            )
+            return result, 200
+        except ValueError as error:
+            logger.warning("Rejected SQL execution request: %s", error)
+            return {"message": str(error)}, 400
+        except SQLAlchemyError:
+            logger.exception("Database SQL execution failed")
+            return {"message": "Database execution failed"}, 503
+        except Exception:
+            logger.exception("Unexpected SQL execution failure")
+            return {"message": "SQL execution failed"}, 500
+
+
 api.add_resource(LoginResource, "/api/auth/login")
 api.add_resource(StudentListResource, "/api/students")
 api.add_resource(StudentResource, "/api/students/<int:student_id>")
+api.add_resource(SqlExecutionResource, "/api/sql/execute")
 
 
 @app.get("/swagger.json")
@@ -269,7 +358,7 @@ SWAGGER_SPEC = {
     "info": {
         "title": "Student Database API",
         "version": "1.0.0",
-        "description": "JWT-protected API for querying student records.",
+            "description": "JWT-protected API for querying per-state Indian student tables.",
     },
     "servers": [{"url": "http://localhost:5000"}],
     "components": {
@@ -319,18 +408,17 @@ SWAGGER_SPEC = {
                 "parameters": [
                     {"name": "page", "in": "query", "schema": {"type": "integer", "default": 1}},
                     {"name": "per_page", "in": "query", "schema": {"type": "integer", "default": 50, "maximum": 1000}},
+                    {"name": "state", "in": "query", "description": "State table code, for example maharashtra.", "schema": {"type": "string"}},
                     {"name": "first_name", "in": "query", "schema": {"type": "string"}},
                     {"name": "last_name", "in": "query", "schema": {"type": "string"}},
                     {"name": "email", "in": "query", "schema": {"type": "string"}},
                     {"name": "city", "in": "query", "schema": {"type": "string"}},
-                    {"name": "state", "in": "query", "schema": {"type": "string"}},
-                    {"name": "country", "in": "query", "schema": {"type": "string"}},
                     {"name": "sort_by", "in": "query", "schema": {"type": "string", "default": "student_id"}},
                     {"name": "sort_order", "in": "query", "schema": {"type": "string", "enum": ["asc", "desc"], "default": "asc"}},
                 ],
                 "responses": {
                     "200": {"description": "Student page returned"},
-                    "401": {"description": "Missing or invalid JWT"},
+                    "401": {"description": JWT_ERROR_DESCRIPTION},
                 },
             }
         },
@@ -338,11 +426,44 @@ SWAGGER_SPEC = {
             "get": {
                 "summary": "Get one student",
                 "security": [{"bearerAuth": []}],
-                "parameters": [{"name": "student_id", "in": "path", "required": True, "schema": {"type": "integer"}}],
+                "parameters": [
+                    {"name": "student_id", "in": "path", "required": True, "schema": {"type": "integer"}},
+                    {"name": "state", "in": "query", "required": True, "description": "State table code, for example maharashtra.", "schema": {"type": "string"}},
+                ],
                 "responses": {
                     "200": {"description": "Student returned"},
                     "404": {"description": "Student not found"},
-                    "401": {"description": "Missing or invalid JWT"},
+                    "401": {"description": JWT_ERROR_DESCRIPTION},
+                },
+            }
+        },
+        "/api/sql/execute": {
+            "post": {
+                "summary": "Execute a safe SQL script",
+                "description": "Requires database and sql. DROP and DELETE are rejected. ALTER TABLE operations are queued per table. Set rollback=true and provide rollback_sql to apply an inverse ALTER.",
+                "security": [{"bearerAuth": []}],
+                "requestBody": {
+                    "required": True,
+                    "content": {
+                        "application/json": {
+                            "schema": {
+                                "type": "object",
+                                "required": ["database", "sql"],
+                                "properties": {
+                                    "database": {"type": "string", "example": "students_db"},
+                                    "sql": {"type": "string", "example": "ALTER TABLE student_maharashtra RENAME COLUMN city TO city_name;"},
+                                    "rollback": {"type": "boolean", "default": False},
+                                    "rollback_sql": {"type": "string", "example": "ALTER TABLE student_maharashtra RENAME COLUMN city_name TO city;"},
+                                },
+                            }
+                        }
+                    },
+                },
+                "responses": {
+                    "200": {"description": "SQL executed with timestamps and status"},
+                    "400": {"description": "Invalid or forbidden SQL"},
+                    "401": {"description": JWT_ERROR_DESCRIPTION},
+                    "503": {"description": "Database execution failure"},
                 },
             }
         },

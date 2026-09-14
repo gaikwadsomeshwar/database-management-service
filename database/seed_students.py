@@ -14,9 +14,15 @@ from faker import Faker
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
+
+sys.path.insert(0, str(PROJECT_ROOT / "app"))
+from state_populations import (  # type: ignore[import-not-found]
+    STATE_POPULATIONS,
+    STATE_STUDENT_COUNTS,
+    STUDENT_POPULATION_RATIO,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,31 +30,23 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-INSERT_STUDENT = text(
-    """
-    INSERT INTO students (
-        first_name,
-        last_name,
-        date_of_birth,
-        email,
-        phone_number,
-        city,
-        state,
-        country,
-        enrollment_date
-    ) VALUES (
-        :first_name,
-        :last_name,
-        :date_of_birth,
-        :email,
-        :phone_number,
-        :city,
-        :state,
-        :country,
-        :enrollment_date
-    )
-    """
-)
+# Shared DDL for every generated `student_<state>` table.
+STUDENT_COLUMNS = """
+    student_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+    first_name VARCHAR(80) NOT NULL,
+    last_name VARCHAR(80) NOT NULL,
+    date_of_birth DATE NOT NULL,
+    email VARCHAR(255) NOT NULL,
+    phone_number VARCHAR(25) NOT NULL,
+    city VARCHAR(100) NOT NULL,
+    state VARCHAR(100) NOT NULL,
+    enrollment_date DATE NOT NULL,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (student_id),
+    UNIQUE KEY uq_email (email),
+    KEY idx_last_name (last_name),
+    KEY idx_enrollment_date (enrollment_date)
+"""
 
 
 def wait_for_database(engine, attempts=30, delay_seconds=2):
@@ -94,11 +92,10 @@ def load_database_url():
     )
 
 
-def build_student(fake, index):
-    """Create one synthetic student record with a unique email."""
+def build_student(fake):
+    """Create one synthetic student record before state-specific enrichment."""
     first_name = fake.first_name()
     last_name = fake.last_name()
-    email = f"{first_name}.{last_name}.{index}@example.edu".lower()
 
     return {
         "first_name": first_name,
@@ -107,11 +104,11 @@ def build_student(fake, index):
             minimum_age=18,
             maximum_age=36,
         ),
-        "email": email,
+        # The seeding loop adds the table name to make the email globally unique.
+        "email": "",
         "phone_number": fake.numerify(text="+1-###-###-####"),
         "city": fake.city(),
         "state": fake.state(),
-        "country": fake.country(),
         "enrollment_date": fake.date_between(
             start_date=date.today() - timedelta(days=11 * 365),
             end_date=date.today(),
@@ -119,43 +116,97 @@ def build_student(fake, index):
     }
 
 
-def seed_students(count, batch_size, seed):
-    """Replace the students table contents with count synthetic records."""
-    if count < 1:
-        raise ValueError("Student count must be greater than zero.")
+def create_state_table(connection, table_name):
+    """Create one isolated student table for an Indian state."""
+    connection.exec_driver_sql(f"DROP TABLE IF EXISTS `{table_name}`")
+    connection.exec_driver_sql(
+        f"CREATE TABLE `{table_name}` ({STUDENT_COLUMNS}) ENGINE=InnoDB"
+    )
 
-    fake = Faker("en_US")
+
+def seed_state(connection, table_name, state_name, count, batch_size, seed):
+    """Create and populate one state's table with deterministic fake data."""
+    fake = Faker("en_IN")
     fake.seed_instance(seed)
+    insert_student = text(
+        f"""
+        INSERT INTO `{table_name}` (
+            first_name, last_name, date_of_birth, email, phone_number,
+            city, state, enrollment_date
+        ) VALUES (
+            :first_name, :last_name, :date_of_birth, :email, :phone_number,
+            :city, :state, :enrollment_date
+        )
+        """
+    )
+    create_state_table(connection, table_name)
+
+    for start in range(0, count, batch_size):
+        batch = []
+        for index in range(start + 1, min(start + batch_size, count) + 1):
+            student = build_student(fake)
+            student["state"] = state_name
+            student["email"] = (
+                f"{student['first_name']}.{student['last_name']}."
+                f"{table_name}.{index}@example.edu"
+            ).lower()
+            batch.append(student)
+        connection.execute(insert_student, batch)
+        logger.info(
+            "%s: inserted %d/%d student records",
+            state_name,
+            min(start + batch_size, count),
+            count,
+        )
+
+
+def seed_students(batch_size, seed):
+    """Rebuild every Indian state table using proportional allocations."""
     engine = create_engine(load_database_url())
     wait_for_database(engine)
 
     try:
         with engine.begin() as connection:
-            connection.execute(text("TRUNCATE TABLE students"))
-
-            for start in range(0, count, batch_size):
-                batch = [
-                    build_student(fake, index)
-                    for index in range(start + 1, min(start + batch_size, count) + 1)
-                ]
-                connection.execute(INSERT_STUDENT, batch)
-                logger.info("Inserted %d/%d student records", min(start + batch_size, count), count)
+            connection.execute(text("DELETE FROM state_metadata"))
+            for table_name, (state_name, population) in STATE_POPULATIONS.items():
+                count = STATE_STUDENT_COUNTS[table_name]
+                connection.execute(
+                    text(
+                        "INSERT INTO state_metadata "
+                        "(state_code, state_name, census_2011_population, "
+                        "assumed_student_ratio, allocated_student_count) VALUES "
+                        "(:code, :name, :population, :ratio, :count)"
+                    ),
+                    {
+                        "code": table_name,
+                        "name": state_name,
+                        "population": population,
+                        "ratio": STUDENT_POPULATION_RATIO,
+                        "count": count,
+                    },
+                )
+                seed_state(
+                    connection,
+                    f"student_{table_name}",
+                    state_name,
+                    count,
+                    batch_size,
+                    seed,
+                )
     except SQLAlchemyError:
         logger.exception("Failed to seed student records")
         raise
 
-    logger.info("Successfully created %d synthetic student records", count)
+    logger.info(
+        "Successfully created %d records across %d Indian states",
+        sum(STATE_STUDENT_COUNTS.values()),
+        len(STATE_STUDENT_COUNTS),
+    )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create synthetic student records in the MySQL students table."
-    )
-    parser.add_argument(
-        "--count",
-        type=int,
-        default=int(os.getenv("STUDENT_COUNT", "100000")),
-        help="Number of records to create (default: 100000).",
+        description="Create proportional student tables for India's 28 states."
     )
     parser.add_argument(
         "--batch-size",
@@ -175,7 +226,7 @@ def main():
         parser.error("--batch-size must be greater than zero")
 
     try:
-        seed_students(args.count, args.batch_size, args.seed)
+        seed_students(args.batch_size, args.seed)
     except (OSError, ValueError, SQLAlchemyError):
         logger.exception("Student data generation failed")
         return 1
