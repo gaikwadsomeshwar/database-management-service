@@ -143,22 +143,6 @@ docker run -d --name student-api --network student-network `
 
 The Docker API is available at `http://localhost:5000`.
 
-`API_HOST=0.0.0.0` is required inside the container so Docker can forward
-host port `5000` to Flask. If the container was created before this setting
-was added, remove and recreate only the API container:
-
-```powershell
-docker rm -f student-api
-docker run -d --name student-api --network student-network `
-  --env-file .env `
-  -e MYSQL_HOST=student-mysql `
-  -e MYSQL_USER=root `
-  -e MYSQL_PASSWORD=your-mysql-password `
-  -p 5000:5000 `
-  student-api:1.0.0 `
-  python api.py
-```
-
 ## Stop Docker containers
 
 ```powershell
