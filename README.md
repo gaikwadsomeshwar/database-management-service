@@ -161,9 +161,11 @@ connection and seeds a different state table. Increase `--workers` or set
 `STUDENT_SEED_WORKERS` only when the MySQL server has enough CPU, memory, and
 connections. `--batch-size` controls rows per insert batch independently.
 
-Seeding is additive. Existing state tables are preserved, and existing rows
-are counted before insertion. If a table already has the target number of
-records, it is skipped; if it has fewer, only the missing records are added.
+Seeding reconciles each table to its target count without recreating it.
+Existing state tables are preserved and counted before insertion. If a table
+has fewer records, only the missing records are added. If it has more records,
+the excess rows with the highest `student_id` values are removed first. A table
+already at the target count is skipped.
 
 ## 5. Start the API container
 

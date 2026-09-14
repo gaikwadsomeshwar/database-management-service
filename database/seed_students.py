@@ -125,9 +125,11 @@ def create_state_table(connection, table_name):
 
 
 def seed_state(connection, table_name, state_name, count, batch_size, seed):
-    """Add only missing rows until one state's target count is reached."""
-    fake = Faker("en_IN")
-    fake.seed_instance(seed)
+    """Converge one state table to its target count.
+
+    Missing rows are appended. If the table is over the target, rows with the
+    highest student IDs are removed first, treating the end as the newest rows.
+    """
     insert_student = text(
         f"""
         INSERT INTO `{table_name}` (
@@ -143,16 +145,35 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
     existing_count = connection.execute(
         text(f"SELECT COUNT(*) FROM `{table_name}`")
     ).scalar_one()
+    excess_count = max(0, existing_count - count)
+
+    if excess_count:
+        connection.exec_driver_sql(
+            f"DELETE FROM `{table_name}` "
+            f"ORDER BY student_id DESC LIMIT {excess_count}"
+        )
+        existing_count -= excess_count
+        logger.info(
+            "%s: removed %d excess records from the end; now %d/%d",
+            state_name,
+            excess_count,
+            existing_count,
+            count,
+        )
+
     missing_count = max(0, count - existing_count)
 
     if missing_count == 0:
         logger.info(
-            "%s: already has %d/%d records; no insert required",
+            "%s: has required %d/%d records; no insert required",
             state_name,
             existing_count,
             count,
         )
-        return 0
+        return excess_count
+
+    fake = Faker("en_IN")
+    fake.seed_instance(seed)
 
     for start in range(0, missing_count, batch_size):
         batch = []
