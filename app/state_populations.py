@@ -35,11 +35,11 @@ STATE_POPULATIONS = {
 
 # Assumption requested by the dataset model: half of each state's population
 # is represented by generated student records.
-STUDENT_POPULATION_RATIO = 0.30
+STUDENT_POPULATION_RATIO = 0.05
 
 
 def student_count_for_state(population):
-    """Return the estimated student count using the 30% assumption."""
+    """Return the estimated student count using the 5% assumption."""
     return max(1, round(population * STUDENT_POPULATION_RATIO))
 
 
