@@ -5,7 +5,7 @@ metadata:
 data:
   MYSQL_HOST: mysql
   MYSQL_PORT: "3306"
-  MYSQL_DATABASE: MyDatabase
+  MYSQL_DATABASE: students_db
   MYSQL_USER: root
   STUDENT_COUNT: "100000"
   STUDENT_BATCH_SIZE: "1000"
