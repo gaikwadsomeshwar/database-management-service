@@ -2,6 +2,7 @@ import configparser
 import logging
 import os
 import sys
+import time
 from pathlib import Path
 from urllib.parse import quote_plus
 
@@ -20,6 +21,25 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger(__name__)
+
+
+def wait_for_database(engine, attempts=30, delay_seconds=2):
+    """Wait for MySQL to accept connections during container startup."""
+    for attempt in range(1, attempts + 1):
+        try:
+            with engine.connect() as connection:
+                connection.exec_driver_sql("SELECT 1")
+            return
+        except SQLAlchemyError:
+            if attempt == attempts:
+                raise
+            logger.warning(
+                "Database is not ready (attempt %d/%d); retrying in %d seconds",
+                attempt,
+                attempts,
+                delay_seconds,
+            )
+            time.sleep(delay_seconds)
 
 
 def load_database_config():
@@ -117,6 +137,7 @@ def execute_sql_file(sql_file_path):
 
         connection_string = load_database_config()
         engine = create_engine(connection_string)
+        wait_for_database(engine)
 
         with engine.begin() as connection:
             for statement_number, statement in enumerate(statements, start=1):

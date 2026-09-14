@@ -2,3 +2,8 @@ sqlalchemy
 pandas
 pymysql
 python-dotenv
+Faker
+Flask
+Flask-RESTful
+Flask-JWT-Extended
+flask-swagger-ui

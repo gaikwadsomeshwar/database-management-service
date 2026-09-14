@@ -7,6 +7,7 @@ venv/
 env/
 
 .env
+k8s/secret.yaml
 *.log
 
 .pytest_cache/
