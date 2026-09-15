@@ -8,8 +8,8 @@ This project provides MySQL tables for synthetic student records across all 28 I
 The records contain first name, last name, date of birth, email, phone number, city, state, and enrollment date. Each state has its own table, such as `student_maharashtra` and `student_uttar_pradesh`.
 
 State allocations use Census 2011 population figures. The generator assumes
-5% of each state's population are students and creates
-`round(population × 0.05)` records for that state. There is no maximum cap;
+2% of each state's population are students and creates
+`round(population × 0.02)` records for that state. There is no maximum cap;
 therefore Uttar Pradesh, the most populous state, receives the largest table.
 
 ## Project structure
