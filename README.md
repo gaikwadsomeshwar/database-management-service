@@ -17,13 +17,20 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 ```text
 ├── app/
 │   ├── api.py                  # Flask API and Swagger UI
-│   └── main.py                 # SQL file runner
+│   ├── main.py                 # SQL file runner
+│   ├── forecast_service.py     # Proactive-autoscaling forecast microservice
+│   └── forecasting/
+│       ├── data_source.py      # Prometheus history fetch (with synthetic fallback)
+│       └── model.py            # Holt-Winters + gradient boosting ensemble
 ├── database/
 │   ├── init/01_students_schema.sql
 │   └── seed_students.py        # Census-proportional state-table generator
 ├── k8s/
 │   ├── api.yaml
 │   ├── app-config.yaml
+│   ├── forecast-config.yaml
+│   ├── forecast-service.yaml
+│   ├── autoscaling.yaml        # Reactive HPA baseline + proactive KEDA ScaledObject
 │   ├── kustomization.yaml
 │   ├── mysql.yaml
 │   ├── secret.example.yaml
@@ -31,6 +38,51 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 ├── Dockerfile
 └── requirements.txt
 ```
+
+## Proactive autoscaling forecast service
+
+`app/forecast_service.py` implements the dissertation's forecasting model: it
+periodically pulls recent request-rate history (from Prometheus, or a
+synthetic seasonal series when `PROMETHEUS_URL` is unset) and fits an
+**ensemble** of two models:
+
+- **Holt-Winters exponential smoothing** (`statsmodels`) — captures trend and
+  daily seasonality in request load.
+- **Gradient-boosted regression** (`scikit-learn`) — learns non-linear lag
+  relationships that pick up sudden bursts the seasonal model smooths over.
+
+The two forecasts are blended by weighted average into a single predicted
+peak request rate, which is converted into a recommended replica count and
+exposed as Prometheus gauges:
+
+- `predicted_request_rate` — forecasted peak requests/sec over the next horizon.
+- `predicted_replicas` — recommended pod count (bounded by min/max replicas).
+
+Run it locally:
+
+```powershell
+$env:PROMETHEUS_URL = ""  # unset -> synthetic history for local testing
+python app/forecast_service.py
+```
+
+Then check `http://localhost:5100/predict` (JSON) or `http://localhost:5100/metrics`
+(Prometheus format).
+
+### Comparing reactive vs. proactive scaling in Kubernetes
+
+`k8s/autoscaling.yaml` defines both scaling strategies against the same
+`student-api` Deployment so they can be benchmarked against each other:
+
+- `student-api-hpa-reactive` — standard CPU-utilization `HorizontalPodAutoscaler`
+  (the reactive baseline described in the dissertation).
+- `student-api-scaledobject-proactive` — a [KEDA](https://keda.sh) `ScaledObject`
+  that scales on the `predicted_replicas` metric from `forecast-service`,
+  requiring KEDA with the Prometheus scaler and a Prometheus instance scraping
+  `forecast-service:5100/metrics`.
+
+Only enable one of the two against the same Deployment at a time; apply/delete
+the relevant manifest with `kubectl apply -f` / `kubectl delete -f` when
+switching between benchmark runs.
 
 ## Configuration
 

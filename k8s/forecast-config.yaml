@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: forecast-config
+data:
+  # Empty PROMETHEUS_URL falls back to a synthetic seasonal traffic series.
+  PROMETHEUS_URL: ""
+  FORECAST_PORT: "5100"
+  FORECAST_HISTORY_SECONDS: "21600"
+  FORECAST_STEP_SECONDS: "60"
+  FORECAST_HORIZON_STEPS: "5"
+  FORECAST_REFRESH_SECONDS: "60"
+  FORECAST_MIN_REPLICAS: "1"
+  FORECAST_MAX_REPLICAS: "10"
+  FORECAST_TARGET_RPS_PER_REPLICA: "20"
