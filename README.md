@@ -138,8 +138,9 @@ Never commit `.env` or `k8s/secret.yaml` with real credentials.
 | `MYSQL_DATABASE`                   | API/seeder/MySQL | Database name on each state's SQL server (default: `students_db`).                                  |
 | `MYSQL_USER`                       | API/seeder       | MySQL account used by the application (default: `root`).                                            |
 | `MYSQL_PASSWORD`                   | API/seeder       | Password for `MYSQL_USER`.                                                                          |
-| `STUDENT_BATCH_SIZE`               | Seeder           | Number of records inserted per transaction batch (default: `1000`, tuned to `20000` in k8s).        |
-| `STUDENT_SEED_WORKERS`             | Seeder           | Number of state SQL servers seeded concurrently (default: `4`, tuned to `28` in k8s).               |
+| `STUDENT_BATCH_SIZE`               | Seeder           | Number of records inserted per transaction batch (default: `1000`, tuned to `10000` in k8s).        |
+| `STUDENT_SEED_WORKERS`             | Seeder           | Number of worker threads per batch (default: `5`, tuned to `5` in k8s).                             |
+| `STUDENT_STATE_BATCH_SIZE`         | Seeder           | Number of state SQL servers seeded per batch (default: `5`, tuned to `5` in k8s).                   |
 | `API_USERNAME`                     | API              | Login username for JWT issuance.                                                                    |
 | `API_PASSWORD`                     | API              | Login password for JWT issuance.                                                                    |
 | `JWT_SECRET_KEY`                   | API              | Private signing key; never send it as a bearer token.                                               |

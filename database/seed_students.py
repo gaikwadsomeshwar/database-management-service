@@ -258,8 +258,8 @@ def seed_one_state(
     return table_name, count, changes
 
 
-def seed_students(batch_size, seed, workers, target_state=None):
-    """Add missing records across all or selected state SQL servers concurrently."""
+def seed_students(batch_size, seed, workers, target_state=None, state_batch_size=5):
+    """Add missing records across state SQL servers in batches of states."""
     if target_state:
         state_key = target_state.strip().lower().removeprefix("student_")
         if state_key not in STATE_POPULATIONS:
@@ -268,42 +268,60 @@ def seed_students(batch_size, seed, workers, target_state=None):
     else:
         items = list(STATE_POPULATIONS.items())
 
-    logger.info("Starting student seeding for %d state SQL server(s) with %d workers", len(items), workers)
+    # Chunk the 28 states into batches of size state_batch_size (e.g. 5 states per batch)
+    state_chunks = [
+        items[i : i + state_batch_size]
+        for i in range(0, len(items), state_batch_size)
+    ]
 
+    total_states = len(items)
+    logger.info(
+        "Starting student seeding for %d state SQL server(s) in %d state batch(es) of up to %d state(s) each (workers=%d)",
+        total_states,
+        len(state_chunks),
+        state_batch_size,
+        workers,
+    )
+
+    completed_total = 0
     try:
-        executor = ThreadPoolExecutor(max_workers=workers)
-        try:
-            jobs = [
-                executor.submit(
-                    seed_one_state,
-                    f"student_{table_name}",
-                    state_name,
-                    population,
-                    STATE_STUDENT_COUNTS[table_name],
-                    batch_size,
-                    seed,
-                )
-                for table_name, (state_name, population) in items
-            ]
-            completed = 0
-            for future in as_completed(jobs):
-                table_name, count, changes = future.result()
-                completed += 1
-                logger.info(
-                    "Completed state server %s (%d records); %d/%d finished",
-                    table_name,
-                    count,
-                    completed,
-                    len(items),
-                )
-                logger.info(
-                    "%s changes: inserted=%d deleted=%d",
-                    table_name,
-                    changes["inserted"],
-                    changes["deleted"],
-                )
-        finally:
-            executor.shutdown(wait=True, cancel_futures=True)
+        for chunk_index, chunk in enumerate(state_chunks, start=1):
+            chunk_workers = min(workers, len(chunk))
+            logger.info(
+                "--- Processing State Batch %d/%d (%d state(s)) ---",
+                chunk_index,
+                len(state_chunks),
+                len(chunk),
+            )
+            with ThreadPoolExecutor(max_workers=chunk_workers) as executor:
+                futures = {
+                    executor.submit(
+                        seed_one_state,
+                        f"student_{table_name}",
+                        state_name,
+                        population,
+                        STATE_STUDENT_COUNTS[table_name],
+                        batch_size,
+                        seed,
+                    ): table_name
+                    for table_name, (state_name, population) in chunk
+                }
+                for future in as_completed(futures):
+                    table_name, count, changes = future.result()
+                    completed_total += 1
+                    logger.info(
+                        "Completed state server student_%s (%d records); %d/%d total finished",
+                        table_name,
+                        count,
+                        completed_total,
+                        total_states,
+                    )
+                    logger.info(
+                        "student_%s changes: inserted=%d deleted=%d",
+                        table_name,
+                        changes["inserted"],
+                        changes["deleted"],
+                    )
     except SQLAlchemyError:
         logger.exception("Failed to seed student records")
         raise
@@ -312,7 +330,7 @@ def seed_students(batch_size, seed, workers, target_state=None):
     logger.info(
         "Successfully reconciled %d records across %d state SQL server(s)",
         total_records,
-        len(items),
+        total_states,
     )
 
 
@@ -335,8 +353,14 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        default=int(os.getenv("STUDENT_SEED_WORKERS", "4")),
-        help="Concurrent state-table workers (default: 4).",
+        default=int(os.getenv("STUDENT_SEED_WORKERS", "5")),
+        help="Concurrent state-table workers (default: 5).",
+    )
+    parser.add_argument(
+        "--state-batch-size",
+        type=int,
+        default=int(os.getenv("STUDENT_STATE_BATCH_SIZE", "5")),
+        help="Number of state SQL servers to seed per batch (default: 5).",
     )
     parser.add_argument(
         "--state",
@@ -350,9 +374,17 @@ def main():
         parser.error("--batch-size must be greater than zero")
     if args.workers < 1:
         parser.error("--workers must be greater than zero")
+    if args.state_batch_size < 1:
+        parser.error("--state-batch-size must be greater than zero")
 
     try:
-        seed_students(args.batch_size, args.seed, args.workers, target_state=args.state)
+        seed_students(
+            args.batch_size,
+            args.seed,
+            args.workers,
+            target_state=args.state,
+            state_batch_size=args.state_batch_size,
+        )
     except (OSError, ValueError, SQLAlchemyError):
         logger.exception("Student data generation failed")
         return 1

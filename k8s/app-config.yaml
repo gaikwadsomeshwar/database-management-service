@@ -5,15 +5,14 @@ metadata:
 data:
   # Distributed per-state SQL server template: resolves to mysql-maharashtra, mysql-karnataka, etc.
   MYSQL_HOST_TEMPLATE: "mysql-{state}"
-  MYSQL_HOST: mysql-maharashtra
   MYSQL_PORT: "3306"
   MYSQL_DATABASE: students_db
   MYSQL_USER: root
-  # Tuned for the ~23.6M-row seed dataset: one worker per state SQL server (28
-  # states) and larger batches to cut round trips; matches seed-job.yaml's
-  # bumped CPU/memory so the extra parallelism can actually be used.
-  STUDENT_BATCH_SIZE: "20000"
-  STUDENT_SEED_WORKERS: "28"
+  # Seed configuration: batch size per insert statement, max worker threads, and state batch size.
+  # Seeding processes 5 states at a time (with 5 workers) to prevent Minikube resource contention.
+  STUDENT_BATCH_SIZE: "10000"
+  STUDENT_SEED_WORKERS: "5"
+  STUDENT_STATE_BATCH_SIZE: "5"
   API_HOST: 0.0.0.0
   API_PORT: "5000"
   JWT_ACCESS_TOKEN_EXPIRES_MINUTES: "60"
