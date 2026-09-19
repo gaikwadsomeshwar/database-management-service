@@ -29,11 +29,15 @@ POST /api/sql/execute
 
 - No `DROP` or `DELETE` statements are used anywhere (enforced by
   [`app/sql_executor.py`](../app/sql_executor.py), which rejects any script
-  containing those keywords). Script 15 demonstrates the intended pattern for
-  removing a student: flipping an `is_active` flag instead of deleting the row.
-- `ALTER TABLE ... ADD COLUMN IF NOT EXISTS` / `ADD INDEX IF NOT EXISTS` and
-  `CREATE OR REPLACE VIEW` are used where possible so scripts can be re-run
-  safely. `CREATE PROCEDURE` and `CREATE TRIGGER` have no `IF NOT EXISTS`
+  containing those keywords, including inside `--` comments). Script 15
+  demonstrates the intended pattern for removing a student: flipping an
+  `is_active` flag instead of removing the row.
+- Column/index additions check `information_schema` and run the `ALTER TABLE`
+  via `PREPARE`/`EXECUTE`/`DEALLOCATE PREPARE` instead of
+  `ADD COLUMN IF NOT EXISTS` / `ADD INDEX IF NOT EXISTS`, since that clause
+  isn't supported by every MySQL version and previously caused a syntax error.
+  `CREATE OR REPLACE VIEW` is used where possible so those scripts can be
+  re-run safely. `CREATE PROCEDURE` and `CREATE TRIGGER` have no `IF NOT EXISTS`
   equivalent in MySQL, so those scripts are intended to run once per table.
 
 ## Folder index

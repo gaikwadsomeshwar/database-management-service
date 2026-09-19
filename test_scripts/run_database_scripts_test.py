@@ -155,28 +155,48 @@ class ApiClient:
 
 
 def run_scripts_for_state(client, database, state_code, scripts):
-    """Apply every script (in order) to one state's table, then roll each back."""
+    """Apply every script (in order) to one state's table, then roll each back.
+
+    Never raises: apply/rollback failures are logged and recorded so one
+    state's failure can't take down other states' threads or later
+    iterations. Applying stops at the first failed script (later scripts may
+    depend on it), but every already-applied script still gets rolled back.
+    """
     table_name = f"student_{state_code}"
     applied = []
+    errors = []
 
     for script_path in scripts:
-        sql_content = script_path.read_text(encoding="utf-8-sig").replace(
-            STATE_TABLE_PLACEHOLDER, table_name
-        )
-        logger.info("[%s] Applying %s", state_code, script_path.name)
-        client.execute_sql(database, sql_content)
-        applied.append(script_path)
+        try:
+            sql_content = script_path.read_text(encoding="utf-8-sig").replace(
+                STATE_TABLE_PLACEHOLDER, table_name
+            )
+            logger.info("[%s] Applying %s", state_code, script_path.name)
+            client.execute_sql(database, sql_content)
+            applied.append(script_path)
+        except Exception as error:
+            logger.exception("[%s] Failed to apply %s", state_code, script_path.name)
+            errors.append(f"apply {script_path.name}: {error}")
+            break
 
     for script_path in reversed(applied):
-        revert_sql = rollback_statement_for(script_path, table_name)
-        logger.info("[%s] Rolling back %s", state_code, script_path.name)
-        client.execute_sql(database, "SELECT 1", rollback=True, rollback_sql=revert_sql)
+        try:
+            revert_sql = rollback_statement_for(script_path, table_name)
+            logger.info("[%s] Rolling back %s", state_code, script_path.name)
+            client.execute_sql(database, "SELECT 1", rollback=True, rollback_sql=revert_sql)
+        except Exception as error:
+            logger.exception("[%s] Failed to roll back %s", state_code, script_path.name)
+            errors.append(f"rollback {script_path.name}: {error}")
 
-    return state_code, len(applied)
+    return state_code, len(applied), errors
 
 
 def run_iteration(client, database, from_folder, to_folder, state_sample_size):
-    """Run one full apply-then-rollback pass across a fresh random state sample."""
+    """Run one full apply-then-rollback pass across a fresh random state sample.
+
+    Always waits for every state's thread to finish before returning, even if
+    some states fail; returns True only if every state completed cleanly.
+    """
     scripts = discover_scripts(from_folder, to_folder)
     available_states = list(STATE_POPULATIONS.keys())
     if state_sample_size > len(available_states):
@@ -192,6 +212,7 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size):
         ", ".join(states),
     )
 
+    iteration_ok = True
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(states)) as executor:
         futures = {
             executor.submit(
@@ -199,10 +220,29 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size):
             ): state_code
             for state_code in states
         }
+        # Iterate every future to completion (as_completed only yields once a
+        # future is done), so the next iteration never starts until every
+        # state's thread from this one has finished, success or failure.
         for future in concurrent.futures.as_completed(futures):
             state_code = futures[future]
-            state_code, script_count = future.result()
-            logger.info("[%s] Completed %d scripts (applied + rolled back)", state_code, script_count)
+            try:
+                state_code, script_count, errors = future.result()
+                if errors:
+                    iteration_ok = False
+                    logger.error(
+                        "[%s] Completed %d scripts with %d error(s): %s",
+                        state_code, script_count, len(errors), "; ".join(errors),
+                    )
+                else:
+                    logger.info(
+                        "[%s] Completed %d scripts (applied + rolled back)",
+                        state_code, script_count,
+                    )
+            except Exception:
+                iteration_ok = False
+                logger.exception("[%s] Thread raised unexpectedly", state_code)
+
+    return iteration_ok
 
 
 def parse_args():
@@ -251,13 +291,22 @@ def main():
         logger.exception("Login failed against %s", args.base_url)
         return 1
 
+    any_failures = False
     for iteration in range(1, args.iterations + 1):
         logger.info("=== Iteration %d/%d ===", iteration, args.iterations)
         try:
-            run_iteration(client, args.database, args.from_folder, args.to_folder, args.states)
+            if not run_iteration(
+                client, args.database, args.from_folder, args.to_folder, args.states
+            ):
+                any_failures = True
         except Exception:
+            # Keep going: a bad iteration shouldn't stop the remaining ones.
+            any_failures = True
             logger.exception("Iteration %d failed", iteration)
-            return 1
+
+    if any_failures:
+        logger.error("Completed all %d iteration(s) with failures", args.iterations)
+        return 1
 
     logger.info("All %d iteration(s) completed successfully", args.iterations)
     return 0

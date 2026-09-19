@@ -1,11 +1,10 @@
+DELIMITER $$
+
 -- Script 20: Create a read-only procedure that searches students by name and city.
 -- Target: any student_<state> table.
 -- Replace every __STATE_TABLE__ with the target table name (e.g. student_maharashtra).
 -- Procedures have no "IF NOT EXISTS" equivalent in MySQL; run this once per table.
--- No DROP or DELETE statements are used.
-
-DELIMITER $$
-
+-- No destructive schema-removal or row-removal statements are used.
 CREATE PROCEDURE `sp___STATE_TABLE___search_students`(
     IN p_first_name VARCHAR(80),
     IN p_last_name VARCHAR(80),

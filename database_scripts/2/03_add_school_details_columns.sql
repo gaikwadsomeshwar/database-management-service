@@ -1,11 +1,31 @@
 -- Script 03: Add school_name and grade_level columns and backfill dummy values.
 -- Target: any student_<state> table.
 -- Replace every __STATE_TABLE__ with the target table name (e.g. student_maharashtra).
--- No DROP or DELETE statements are used.
+-- No destructive schema-removal or row-removal statements are used.
+-- Uses information_schema + dynamic SQL instead of "ADD COLUMN IF NOT EXISTS"
+-- for compatibility with MySQL versions that reject that clause.
 
-ALTER TABLE `__STATE_TABLE__`
-    ADD COLUMN IF NOT EXISTS school_name VARCHAR(160) NULL AFTER state,
-    ADD COLUMN IF NOT EXISTS grade_level VARCHAR(20) NULL AFTER school_name;
+SET @col_exists = (
+    SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '__STATE_TABLE__' AND COLUMN_NAME = 'school_name'
+);
+SET @ddl = IF(@col_exists = 0,
+    'ALTER TABLE `__STATE_TABLE__` ADD COLUMN school_name VARCHAR(160) NULL AFTER state',
+    'SELECT 1');
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+
+SET @col_exists = (
+    SELECT COUNT(*) FROM information_schema.COLUMNS
+    WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '__STATE_TABLE__' AND COLUMN_NAME = 'grade_level'
+);
+SET @ddl = IF(@col_exists = 0,
+    'ALTER TABLE `__STATE_TABLE__` ADD COLUMN grade_level VARCHAR(20) NULL AFTER school_name',
+    'SELECT 1');
+PREPARE stmt FROM @ddl;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
 
 UPDATE `__STATE_TABLE__`
 SET

@@ -2,7 +2,7 @@
 -- Target: any student_<state> table.
 -- Replace every __STATE_TABLE__ with the target table name (e.g. student_maharashtra).
 -- Triggers have no "IF NOT EXISTS" equivalent in MySQL; run this once per table.
--- No DROP or DELETE statements are used.
+-- No destructive schema-removal or row-removal statements are used.
 
 CREATE TABLE IF NOT EXISTS `__STATE_TABLE___audit_log` (
     audit_id BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
