@@ -39,9 +39,18 @@ load_dotenv(PROJECT_ROOT / ".env")
 sys.path.insert(0, str(PROJECT_ROOT / "app"))
 from state_populations import STATE_POPULATIONS  # noqa: E402
 
+LOGS_DIR = PROJECT_ROOT / "logs"
+LOGS_DIR.mkdir(exist_ok=True)
+LOG_FORMAT = "%(asctime)s [%(levelname)s] %(threadName)s: %(message)s"
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(threadName)s: %(message)s",
+    format=LOG_FORMAT,
+    handlers=[
+        logging.StreamHandler(),
+        # Separate log file for this component, alongside console output.
+        logging.FileHandler(LOGS_DIR / "test_script.txt", encoding="utf-8"),
+    ],
 )
 logger = logging.getLogger(__name__)
 

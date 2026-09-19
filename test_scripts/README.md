@@ -1,7 +1,7 @@
 # test_scripts
 
-A plain Python script for manually load-testing the SQL execution API against
-`database_scripts/` — not a container, Job, or Pod.
+Plain Python scripts for manually load-testing and debugging the API — not
+containers, Jobs, or Pods.
 
 ## What it does
 
@@ -52,3 +52,25 @@ a harmless `SELECT 1` is used instead.
 same state more than once (e.g. across iterations, if `random.sample` repeats
 a state) will fail on the second run with an "already exists" error — this is
 expected and matches the documented behavior in `database_scripts/README.md`.
+
+## Collecting logs
+
+Both scripts write to `logs/` at the project root (git-ignored except for a
+`.gitkeep`), one text file per component:
+
+- `run_database_scripts_test.py` appends its own run log to `logs/test_script.txt`
+  (in addition to printing to the console).
+- `collect_pod_logs.py` pulls current and (if present) previous/crashed
+  container logs for each known component — `student-api`, `forecast-service`,
+  `mysql`, `prometheus`, `seed-students` — via `kubectl logs`, writing each to
+  its own `logs/<component>.txt`:
+
+  ```powershell
+  python test_scripts/collect_pod_logs.py
+  python test_scripts/collect_pod_logs.py --namespace default --tail 500
+  python test_scripts/collect_pod_logs.py --components student-api mysql
+  ```
+
+  Requires `kubectl` on `PATH` and a working cluster context; failures for one
+  component (e.g. no matching pods) are written into that component's file
+  instead of stopping the others.
