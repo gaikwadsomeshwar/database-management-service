@@ -155,6 +155,12 @@ All recommendations are exposed as Prometheus gauges (`predicted_replicas`,
 below). Vertical scaling can be disabled with `VERTICAL_SCALING_ENABLED=false`
 in `k8s/forecast-config.yaml` if only horizontal scaling is being benchmarked.
 
+> Note: `kubectl apply -k k8s` re-applies `k8s/api.yaml`'s static resource
+> values every time, which overwrites whatever the vertical scaler last
+> patched live. This is expected — the next forecast cycle (within
+> `FORECAST_REFRESH_SECONDS`, subject to the change threshold/cooldown) will
+> simply re-converge the Deployment back to the current recommendation.
+
 ## Configuration
 
 The local `.env` file contains the Docker values and credentials. Use strong values for passwords and `JWT_SECRET_KEY`:

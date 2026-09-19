@@ -38,10 +38,13 @@ spec:
                   key: MYSQL_PASSWORD
           resources:
             requests:
-              cpu: "2"
+              cpu: "1"
               memory: 2Gi
               ephemeral-storage: 1Gi
             limits:
-              cpu: "4"
+              # Python's GIL limits how much a single seeder process benefits
+              # from >2 cores anyway; kept modest to avoid cgroup quota issues
+              # seen on some Docker Desktop/WSL2 minikube setups with cpu: "4".
+              cpu: "2"
               memory: 4Gi
               ephemeral-storage: 2Gi
