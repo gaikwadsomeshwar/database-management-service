@@ -1,7 +1,7 @@
-# Runs the schema creation + student-record seeding once, against the shared
-# `mysql` Deployment, before student-api starts. student-api's initContainer
-# (see api.yaml) waits for this Job to reach Complete rather than re-running
-# the seeding logic itself.
+# Runs the schema creation + student-record seeding once, against the distributed
+# per-state MySQL servers (one SQL server per Indian state), before student-api starts.
+# student-api's initContainer (see api.yaml) waits for this Job to reach Complete
+# rather than re-running the seeding logic itself.
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -9,7 +9,7 @@ metadata:
 spec:
   backoffLimit: 6
   ttlSecondsAfterFinished: 3600
-  # ~23.6M rows across 28 state tables at a conservative combined 4000 rows/sec
+  # ~23.6M rows across 28 state servers at a conservative combined 4000 rows/sec
   # (23,563,809 / 4000 ≈ 5891s) plus a 20-minute startup/connection buffer.
   activeDeadlineSeconds: 7200
   template:
@@ -26,7 +26,7 @@ spec:
           command:
             - sh
             - -c
-            - python main.py /database/init/01_students_schema.sql && python /database/seed_students.py
+            - python /database/seed_students.py
           envFrom:
             - configMapRef:
                 name: student-app-config

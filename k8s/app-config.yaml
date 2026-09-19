@@ -3,11 +3,13 @@ kind: ConfigMap
 metadata:
   name: student-app-config
 data:
-  MYSQL_HOST: mysql
+  # Distributed per-state SQL server template: resolves to mysql-maharashtra, mysql-karnataka, etc.
+  MYSQL_HOST_TEMPLATE: "mysql-{state}"
+  MYSQL_HOST: mysql-maharashtra
   MYSQL_PORT: "3306"
   MYSQL_DATABASE: students_db
   MYSQL_USER: root
-  # Tuned for the ~23.6M-row seed dataset: one worker per state table (28
+  # Tuned for the ~23.6M-row seed dataset: one worker per state SQL server (28
   # states) and larger batches to cut round trips; matches seed-job.yaml's
   # bumped CPU/memory so the extra parallelism can actually be used.
   STUDENT_BATCH_SIZE: "20000"

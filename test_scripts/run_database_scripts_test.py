@@ -1,10 +1,12 @@
-"""Randomized database_scripts test harness.
+"""Randomized database_scripts test harness for distributed per-state SQL servers.
 
 Applies every script in a database_scripts folder range (e.g. 1 to 5) to a
 random sample of state tables, in parallel across states, using only the
-existing Flask API (POST /api/auth/login, POST /api/sql/execute) - no direct
-database access. After a state's scripts are applied, each one is rolled back
-in reverse order via the SQL execution API's rollback feature.
+existing Flask API (POST /api/auth/login, POST /api/sql/execute) which routes
+to each state's dedicated MySQL server (e.g. mysql-maharashtra) - no direct
+database access. Scripts are applied in order; execution stops at the first
+failure for a given state so that later scripts (which may depend on it) are
+not attempted.
 
 This is a plain script for local/manual testing only - it is not deployed as
 a container, Job, or Pod.
@@ -53,40 +55,7 @@ logging.basicConfig(
     ],
 )
 logger = logging.getLogger(__name__)
-
 STATE_TABLE_PLACEHOLDER = "__STATE_TABLE__"
-
-# Hand-authored inverse of each script's DATA changes only. Schema objects
-# (added columns, procedures, views, triggers, indexes) are intentionally left
-# in place: app/sql_executor.py rejects any DROP/DELETE statement by design,
-# so only the data a script wrote can be rolled back through this API.
-ROLLBACK_STATEMENTS = {
-    "01_add_guardian_contact_columns.sql": (
-        "UPDATE `{table}` SET guardian_name = NULL, guardian_phone = NULL"
-    ),
-    "02_add_blood_group_column.sql": "UPDATE `{table}` SET blood_group = NULL",
-    "03_add_school_details_columns.sql": (
-        "UPDATE `{table}` SET school_name = NULL, grade_level = NULL"
-    ),
-    "04_add_emergency_contact_columns.sql": (
-        "UPDATE `{table}` SET emergency_contact_name = NULL, "
-        "emergency_contact_phone = NULL"
-    ),
-    "05_add_address_columns.sql": (
-        "UPDATE `{table}` SET address_line = NULL, postal_code = NULL"
-    ),
-    # nationality/is_active are NOT NULL with a default, so "rollback" restores
-    # the default instead of NULL; the column itself can't be dropped.
-    "06_add_nationality_column.sql": "UPDATE `{table}` SET nationality = 'Indian'",
-    "07_add_is_active_column.sql": "UPDATE `{table}` SET is_active = 1",
-    "08_add_student_category_column.sql": "UPDATE `{table}` SET student_category = NULL",
-    "19_add_parent_details_columns.sql": (
-        "UPDATE `{table}` SET parent_occupation = NULL, parent_email = NULL"
-    ),
-}
-# Everything else (procedures/views/triggers/indexes/audit tables) writes no
-# row data on creation, so there is nothing to revert; use a harmless no-op.
-DEFAULT_ROLLBACK_STATEMENT = "SELECT 1"
 
 
 def discover_scripts(from_folder, to_folder):
@@ -104,12 +73,6 @@ def discover_scripts(from_folder, to_folder):
     if not scripts:
         raise ValueError(f"No scripts found in folders {from_folder}-{to_folder}")
     return scripts
-
-
-def rollback_statement_for(script_path, table_name):
-    """Return this script's data-revert statement, or a no-op if none applies."""
-    template = ROLLBACK_STATEMENTS.get(script_path.name, DEFAULT_ROLLBACK_STATEMENT)
-    return template.format(table=table_name)
 
 
 class ApiClient:
@@ -132,10 +95,10 @@ class ApiClient:
         response.raise_for_status()
         return response.json()["access_token"]
 
-    def execute_sql(self, database, sql, rollback=False, rollback_sql=None):
-        body = {"database": database, "sql": sql, "rollback": rollback}
-        if rollback_sql:
-            body["rollback_sql"] = rollback_sql
+    def execute_sql(self, database, sql, state=None):
+        body = {"database": database, "sql": sql}
+        if state:
+            body["state"] = state
 
         with self._lock:
             token = self._token
@@ -164,15 +127,15 @@ class ApiClient:
 
 
 def run_scripts_for_state(client, database, state_code, scripts):
-    """Apply every script (in order) to one state's table, then roll each back.
+    """Apply every script (in order) to one state's dedicated MySQL server.
 
-    Never raises: apply/rollback failures are logged and recorded so one
-    state's failure can't take down other states' threads or later
-    iterations. Applying stops at the first failed script (later scripts may
-    depend on it), but every already-applied script still gets rolled back.
+    Never raises: failures are logged and recorded so one state's failure
+    can't take down other states' threads or later iterations. Stops at the
+    first failed script so that later scripts (which may depend on it) are
+    not attempted.
     """
     table_name = f"student_{state_code}"
-    applied = []
+    applied = 0
     errors = []
 
     for script_path in scripts:
@@ -181,27 +144,18 @@ def run_scripts_for_state(client, database, state_code, scripts):
                 STATE_TABLE_PLACEHOLDER, table_name
             )
             logger.info("[%s] Applying %s", state_code, script_path.name)
-            client.execute_sql(database, sql_content)
-            applied.append(script_path)
+            client.execute_sql(database, sql_content, state=state_code)
+            applied += 1
         except Exception as error:
             logger.exception("[%s] Failed to apply %s", state_code, script_path.name)
             errors.append(f"apply {script_path.name}: {error}")
             break
 
-    for script_path in reversed(applied):
-        try:
-            revert_sql = rollback_statement_for(script_path, table_name)
-            logger.info("[%s] Rolling back %s", state_code, script_path.name)
-            client.execute_sql(database, "SELECT 1", rollback=True, rollback_sql=revert_sql)
-        except Exception as error:
-            logger.exception("[%s] Failed to roll back %s", state_code, script_path.name)
-            errors.append(f"rollback {script_path.name}: {error}")
-
-    return state_code, len(applied), errors
+    return state_code, applied, errors
 
 
 def run_iteration(client, database, from_folder, to_folder, state_sample_size):
-    """Run one full apply-then-rollback pass across a fresh random state sample.
+    """Apply all scripts in the folder range to a fresh random state sample.
 
     Always waits for every state's thread to finish before returning, even if
     some states fail; returns True only if every state completed cleanly.
@@ -244,7 +198,7 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size):
                     )
                 else:
                     logger.info(
-                        "[%s] Completed %d scripts (applied + rolled back)",
+                        "[%s] Applied %d scripts successfully",
                         state_code, script_count,
                     )
             except Exception:
@@ -256,7 +210,7 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Apply a database_scripts folder range to random states, then roll back.",
+        description="Apply a database_scripts folder range to random states in parallel.",
     )
     parser.add_argument(
         "--from", dest="from_folder", type=int, required=True,

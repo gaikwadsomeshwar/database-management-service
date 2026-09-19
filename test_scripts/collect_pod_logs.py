@@ -3,8 +3,8 @@
 A plain Python script for manual/local debugging - it is not deployed as a
 container, Job, or Pod. Wraps `kubectl logs` (current and, where available,
 `--previous` for crashed containers) for each known component and writes one
-file per component under `logs/`, so `student-api`'s errors, `mysql`'s
-errors, etc. can be inspected without re-running `kubectl` by hand.
+file per component under `logs/`, collecting logs from all 28 per-state MySQL pods
+into `logs/mysql.txt`, `student-api`'s errors into `logs/student-api.txt`, etc.
 
 Usage:
     python test_scripts/collect_pod_logs.py

@@ -1,4 +1,9 @@
-"""Safe, logged MySQL script execution shared by the CLI and API."""
+"""Safe, logged MySQL script execution with per-state database routing.
+
+Supports distributed multi-server architecture with one SQL server per Indian
+state. Scripts targeting a specific state table (e.g. `student_maharashtra`) are
+automatically routed to that state's dedicated SQL server (e.g. `mysql-maharashtra`).
+"""
 
 import configparser
 import logging
@@ -28,6 +33,7 @@ ALTER_TABLE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 FORBIDDEN_PATTERN = re.compile(r"\b(DROP|DELETE)\b", re.IGNORECASE)
+STUDENT_TABLE_PATTERN = re.compile(r"\bstudent_([a-z_]+)\b", re.IGNORECASE)
 TABLE_LOCKS = defaultdict(threading.Lock)
 
 
@@ -68,8 +74,32 @@ def validate_statements(statements):
             )
 
 
-def database_url(database):
-    """Build a connection URL for the database named by the request."""
+def infer_state_from_sql(sql_content):
+    """Detect the Indian state code from `student_<state>` table references in SQL."""
+    match = STUDENT_TABLE_PATTERN.search(sql_content)
+    if match:
+        return match.group(1).lower()
+    return None
+
+
+def resolve_mysql_host(state=None):
+    """Resolve the target MySQL hostname for a given state.
+
+    In a distributed architecture (one SQL server per state), uses
+    MYSQL_HOST_TEMPLATE (default: `mysql-{state}`) with hyphens.
+    Falls back to MYSQL_HOST if no state is specified or when running in a single-host setup.
+    """
+    if state:
+        state_code = state.strip().lower().removeprefix("student_")
+        state_slug = state_code.replace("_", "-")
+        template = os.getenv("MYSQL_HOST_TEMPLATE", "mysql-{state}")
+        return template.format(state=state_slug)
+
+    return os.getenv("MYSQL_HOST", "127.0.0.1")
+
+
+def database_url(database, state=None):
+    """Build a connection URL for the database and target state's SQL server."""
     if not database or not IDENTIFIER_PATTERN.fullmatch(database):
         raise ValueError(
             "database must contain only letters, numbers, and underscores."
@@ -86,13 +116,17 @@ def database_url(database):
     def setting(name, default=None):
         return os.getenv(name, section.get(name.lower(), default))
 
-    existing_url = setting("DATABASE_URL")
-    if existing_url and database == setting("MYSQL_DATABASE"):
-        return existing_url
+    # If state is provided or inferred, route to that state's dedicated SQL server.
+    if state:
+        host = resolve_mysql_host(state)
+    else:
+        existing_url = setting("DATABASE_URL")
+        if existing_url and database == setting("MYSQL_DATABASE"):
+            return existing_url
+        host = setting("MYSQL_HOST", "127.0.0.1")
 
-    host = setting("MYSQL_HOST", "localhost")
     port = setting("MYSQL_PORT", "3306")
-    username = setting("MYSQL_USER")
+    username = setting("MYSQL_USER", "root")
     password = setting("MYSQL_PASSWORD")
     if not username or password is None:
         raise ValueError("MYSQL_USER and MYSQL_PASSWORD must be configured.")
@@ -110,8 +144,12 @@ def table_for_alter(statement):
     return match.group(1).lower() if match else None
 
 
-def execute_sql_script(database, sql_content, rollback=False, rollback_sql=None):
+def execute_sql_script(database, sql_content, rollback=False, rollback_sql=None, state=None):
     """Execute safe SQL and return timing/status details.
+
+    Routes execution to the designated state's dedicated SQL server. If `state`
+    is omitted, attempts to infer the target state from `student_<state>` table
+    references within the SQL script.
 
     ALTER TABLE statements are serialized per table. Since MySQL implicitly
     commits most DDL, an ALTER rollback requires explicit inverse SQL supplied
@@ -123,6 +161,11 @@ def execute_sql_script(database, sql_content, rollback=False, rollback_sql=None)
     if not statements:
         raise ValueError("SQL script is empty.")
     validate_statements(statements)
+
+    # Resolve target state from explicit argument or SQL content
+    target_state = state or infer_state_from_sql(sql_content)
+    target_url = database_url(database, state=target_state)
+    target_host = resolve_mysql_host(target_state)
 
     alter_tables = {table_for_alter(statement) for statement in statements}
     alter_tables.discard(None)
@@ -138,13 +181,15 @@ def execute_sql_script(database, sql_content, rollback=False, rollback_sql=None)
         lock.acquire()
 
     try:
-        engine = create_engine(database_url(database), pool_pre_ping=True)
+        engine = create_engine(target_url, pool_pre_ping=True)
         with engine.begin() as connection:
             for number, statement in enumerate(statements, start=1):
                 logger.info(
-                    "Executing statement=%d database=%s alter_table=%s",
+                    "Executing statement=%d database=%s host=%s state=%s alter_table=%s",
                     number,
                     database,
+                    target_host,
+                    target_state,
                     table_for_alter(statement),
                 )
                 connection.exec_driver_sql(statement)
@@ -155,13 +200,18 @@ def execute_sql_script(database, sql_content, rollback=False, rollback_sql=None)
                 for statement in rollback_statements:
                     connection.exec_driver_sql(statement)
                 logger.warning(
-                    "Rollback SQL executed by request database=%s", database
+                    "Rollback SQL executed by request database=%s host=%s state=%s",
+                    database,
+                    target_host,
+                    target_state,
                 )
 
         finished_at = datetime.now(timezone.utc)
         result = {
             "status": "rolled_back" if rollback else "success",
             "database": database,
+            "target_state": target_state,
+            "target_host": target_host,
             "statement_count": len(statements),
             "started_at": started_at.isoformat(),
             "finished_at": finished_at.isoformat(),
@@ -173,8 +223,10 @@ def execute_sql_script(database, sql_content, rollback=False, rollback_sql=None)
     except (ValueError, SQLAlchemyError):
         finished_at = datetime.now(timezone.utc)
         logger.exception(
-            "SQL script failed database=%s started_at=%s finished_at=%s duration_ms=%.2f",
+            "SQL script failed database=%s host=%s state=%s started_at=%s finished_at=%s duration_ms=%.2f",
             database,
+            target_host,
+            target_state,
             started_at.isoformat(),
             finished_at.isoformat(),
             (time.perf_counter() - start) * 1000,

@@ -1,11 +1,11 @@
 # Student Database Service
 
-This project provides MySQL tables for synthetic student records across all 28 Indian states and a secured Flask REST API. It can run in either:
+This project provides a distributed, sharded database platform with **one dedicated MySQL server per Indian state** (28 independent SQL servers) and a secured Flask REST API with proactive autoscaling. It can run in either:
 
 - Standalone Docker containers.
-- Kubernetes using the manifests in `k8s/`.
+- Kubernetes (Minikube, Kind, or cloud clusters) using the manifests in `k8s/`.
 
-The records contain first name, last name, date of birth, email, phone number, city, state, and enrollment date. Each state has its own table, such as `student_maharashtra` and `student_uttar_pradesh`.
+Each state has its own dedicated SQL server instance and Service (e.g. `mysql-maharashtra`, `mysql-andhra-pradesh`), hosting that state's dedicated table, such as `student_maharashtra` and `student_uttar_pradesh`, alongside its metadata schema. This eliminates cross-state lock contention and InnoDB redo-log bottlenecks while keeping state data strictly isolated.
 
 State allocations use Census 2011 population figures. The generator assumes
 2% of each state's population are students and creates
@@ -16,46 +16,56 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 
 ```text
 ├── app/
-│   ├── api.py                  # Flask API and Swagger UI
-│   ├── main.py                 # SQL file runner
+│   ├── api.py                  # Flask API with dynamic per-state database routing and Swagger UI
+│   ├── main.py                 # Safe SQL script runner (supports --state and --all-states)
+│   ├── sql_executor.py         # State-aware SQL execution and auto-detection
 │   ├── forecast_service.py     # Proactive-autoscaling forecast microservice
 │   └── forecasting/
 │       ├── data_source.py      # Prometheus history fetch (with synthetic fallback)
 │       └── model.py            # Holt-Winters + gradient boosting ensemble
 ├── database/
-│   ├── init/01_students_schema.sql
-│   └── seed_students.py        # Census-proportional state-table generator
+│   ├── init/01_students_schema.sql  # State metadata schema initialized on each SQL server
+│   └── seed_students.py        # Parallel population-proportional per-state seeder
 ├── k8s/
-│   ├── api.yaml
-│   ├── app-config.yaml
+│   ├── generate_mysql_manifests.py # Manifest generator for all 28 per-state SQL servers
+│   ├── mysql.yaml              # 28 Deployments, Services, and PVCs (one per Indian state)
+│   ├── api.yaml                # student-api Deployment and Service
+│   ├── app-config.yaml         # ConfigMap with MYSQL_HOST_TEMPLATE="mysql-{state}"
 │   ├── forecast-config.yaml
 │   ├── forecast-service.yaml
 │   ├── monitoring.yaml         # In-cluster Prometheus scraping forecast-service/student-api
 │   ├── hpa-reactive.yaml       # Reactive CPU-based HPA (baseline)
 │   ├── scaledobject-proactive.yaml  # KEDA ScaledObject driven by the forecast (enabled by default)
 │   ├── kustomization.yaml
-│   ├── mysql.yaml
 │   ├── secret.example.yaml
 │   └── secret.yaml             # local only; ignored by Git
+├── test_scripts/
+│   ├── run_database_scripts_test.py # Randomized test harness routing SQL across state servers
+│   └── collect_pod_logs.py     # Collects pod logs (including all 28 state MySQL pods)
 ├── Dockerfile
 └── requirements.txt
 ```
 
+## Distributed Per-State SQL Architecture
+
+Instead of hosting multiple state tables within a single monolithic MySQL pod, the architecture provides **one SQL server per state**:
+
+1. **State Isolation**: Each Indian state has a dedicated MySQL pod and ClusterIP Service named `mysql-<state>` (e.g. `mysql-maharashtra`, `mysql-karnataka`).
+2. **Resource Right-Sizing**: Each MySQL pod requests `30m CPU` and `120Mi RAM` (limits: `300m CPU`, `512Mi RAM`) with `--innodb-buffer-pool-size=64M`. All 28 pods collectively reserve ~0.84 CPU cores and ~3.3 GB RAM, running comfortably on standard developer machines and Minikube.
+3. **Independent Storage**: Each state server has its own 1Gi `PersistentVolumeClaim` (`mysql-data-<state>`).
+4. **Dynamic Routing**:
+   - The Flask API (`app/api.py`) routes single-state queries (`/api/students?state=maharashtra`) directly to `mysql-maharashtra`.
+   - Global queries (`/api/students` without `state`) execute parallel fan-out queries across all 28 state servers via `ThreadPoolExecutor` and aggregate the paginated results.
+   - The SQL executor (`app/sql_executor.py`) automatically detects table references like `student_maharashtra` to target the corresponding SQL server.
+
 ## Proactive autoscaling forecast service
 
-`app/forecast_service.py` implements the dissertation's forecasting model: it
-periodically pulls recent request-rate history (from Prometheus, or a
-synthetic seasonal series when `PROMETHEUS_URL` is unset) and fits an
-**ensemble** of two models:
+`app/forecast_service.py` implements the forecasting model: it periodically pulls recent request-rate history (from Prometheus, or a synthetic seasonal series when `PROMETHEUS_URL` is unset) and fits an **ensemble** of two models:
 
-- **Holt-Winters exponential smoothing** (`statsmodels`) — captures trend and
-  daily seasonality in request load.
-- **Gradient-boosted regression** (`scikit-learn`) — learns non-linear lag
-  relationships that pick up sudden bursts the seasonal model smooths over.
+- **Holt-Winters exponential smoothing** (`statsmodels`) — captures trend and daily seasonality in request load.
+- **Gradient-boosted regression** (`scikit-learn`) — learns non-linear lag relationships that pick up sudden bursts the seasonal model smooths over.
 
-The two forecasts are blended by weighted average into a single predicted
-peak request rate, which is converted into a recommended replica count and
-exposed as Prometheus gauges:
+The two forecasts are blended by weighted average into a single predicted peak request rate, which is converted into a recommended replica count and exposed as Prometheus gauges:
 
 - `predicted_request_rate` — forecasted peak requests/sec over the next horizon.
 - `predicted_replicas` — recommended pod count (bounded by min/max replicas).
@@ -67,28 +77,18 @@ $env:PROMETHEUS_URL = ""  # unset -> synthetic history for local testing
 python app/forecast_service.py
 ```
 
-Then check `http://localhost:5100/predict` (JSON) or `http://localhost:5100/metrics`
-(Prometheus format).
+Then check `http://localhost:5100/predict` (JSON) or `http://localhost:5100/metrics` (Prometheus format).
 
 ### Comparing reactive vs. proactive scaling in Kubernetes
 
-Two autoscalers target the same `student-api` Deployment so they can be
-benchmarked against each other, but **only one may be active at a time** —
-KEDA's admission webhook rejects a `ScaledObject` if an HPA already manages
-the Deployment, and vice versa:
+Two autoscalers target the same `student-api` Deployment so they can be benchmarked against each other, but **only one may be active at a time** — KEDA's admission webhook rejects a `ScaledObject` if an HPA already manages the Deployment, and vice versa:
 
-- `k8s/hpa-reactive.yaml` — standard CPU-utilization `HorizontalPodAutoscaler`
-  (the reactive baseline described in the dissertation).
-- `k8s/scaledobject-proactive.yaml` — a [KEDA](https://keda.sh) `ScaledObject`
-  that scales on the `predicted_replicas` metric from `forecast-service`,
-  scraped by the in-cluster Prometheus in `k8s/monitoring.yaml`.
+- `k8s/hpa-reactive.yaml` — standard CPU-utilization `HorizontalPodAutoscaler` (the reactive baseline).
+- `k8s/scaledobject-proactive.yaml` — a [KEDA](https://keda.sh) `ScaledObject` that scales on the `predicted_replicas` metric from `forecast-service`, scraped by the in-cluster Prometheus in `k8s/monitoring.yaml`.
 
 `k8s/kustomization.yaml` includes `scaledobject-proactive.yaml` by default.
 
 #### Install KEDA (one-time, required for the proactive ScaledObject)
-
-The `ScaledObject` kind is a CRD provided by [KEDA](https://keda.sh); it must
-be installed before `kubectl apply -k k8s` will accept `scaledobject-proactive.yaml`:
 
 ```powershell
 helm repo add kedacore https://kedacore.github.io/charts
@@ -98,9 +98,6 @@ helm install keda kedacore/keda --namespace keda
 ```
 
 #### Switching between reactive and proactive scaling
-
-Edit `k8s/kustomization.yaml` to reference the manifest you want, then apply.
-Switching requires removing the previously active autoscaler first:
 
 ```powershell
 # Switch to reactive (CPU-based) scaling
@@ -112,60 +109,13 @@ kubectl delete -f k8s/hpa-reactive.yaml --ignore-not-found
 kubectl apply -f k8s/scaledobject-proactive.yaml
 ```
 
-### Combined horizontal + vertical learning scaler
-
-Autoscaling here isn't "replicate the same pod" — `forecast_service.py` runs
-two complementary learned recommendations every cycle (`FORECAST_REFRESH_SECONDS`,
-default 60s), instead of only ever adding identical, potentially
-over-provisioned copies:
-
-**Horizontal (how many replicas)** blends two signals and takes the max, so
-neither dominates:
-
-- _Proactive_: the request-rate ensemble forecast (`predicted_replicas_from_forecast`).
-- _Reactive safety net_: current in-flight request "queue depth"
-  (`student_api_active_requests`, incremented/decremented per request in
-  `api.py`), converted to replicas via `FORECAST_TARGET_ACTIVE_REQUESTS_PER_REPLICA`
-  (`predicted_replicas_from_queue`) — this catches sudden bursts the trend
-  model hasn't learned yet, without waiting a full forecast cycle.
-
-**Vertical (how big each replica)** forecasts per-replica CPU/memory usage
-(`forecasting/data_source.py` queries per-pod averages, e.g.
-`avg(rate(container_cpu_usage_seconds_total{...}))`) with the same
-Holt-Winters + gradient-boosting ensemble, then `vertical_scaler.py`:
-
-1. Multiplies the forecasted peak by a headroom ratio (`VERTICAL_CPU_HEADROOM_RATIO`,
-   `VERTICAL_MEMORY_HEADROOM_RATIO`, default 1.3x) — enough margin to avoid
-   throttling/OOM without provisioning for a peak that may never happen.
-2. Clamps the result to `VERTICAL_MIN/MAX_CPU_MILLICORES` and
-   `VERTICAL_MIN/MAX_MEMORY_MIB` so a bad prediction can't runaway-provision.
-3. Only patches `student-api`'s container `resources` (which triggers a
-   rolling update, not an in-place resize) if the change exceeds
-   `VERTICAL_CHANGE_THRESHOLD_RATIO` (default 20%) **and** at least
-   `VERTICAL_SCALE_COOLDOWN_SECONDS` (default 600s) have passed since the last
-   patch — this is what keeps cost in check: no thrashing, no restarts for
-   noise-level changes, and resources always stay inside the configured
-   ceiling instead of being over-provisioned "just in case".
-
-All recommendations are exposed as Prometheus gauges (`predicted_replicas`,
-`predicted_replicas_from_forecast`, `predicted_replicas_from_queue`,
-`observed_active_requests`, `recommended_cpu_millicores`,
-`recommended_memory_mib`, `vertical_scale_applied_total`) and via
-`GET /predict` on `forecast-service`, and are visible on the `/dashboard` (see
-below). Vertical scaling can be disabled with `VERTICAL_SCALING_ENABLED=false`
-in `k8s/forecast-config.yaml` if only horizontal scaling is being benchmarked.
-
-> Note: `kubectl apply -k k8s` re-applies `k8s/api.yaml`'s static resource
-> values every time, which overwrites whatever the vertical scaler last
-> patched live. This is expected — the next forecast cycle (within
-> `FORECAST_REFRESH_SECONDS`, subject to the change threshold/cooldown) will
-> simply re-converge the Deployment back to the current recommendation.
-
 ## Configuration
 
-The local `.env` file contains the Docker values and credentials. Use strong values for passwords and `JWT_SECRET_KEY`:
+The local `.env` file contains configuration values and credentials. Use strong values for passwords and `JWT_SECRET_KEY`:
 
 ```dotenv
+MYSQL_HOST_TEMPLATE=mysql-{state}
+MYSQL_HOST=127.0.0.1
 MYSQL_DATABASE=students_db
 MYSQL_USER=root
 MYSQL_PASSWORD=your-mysql-password
@@ -180,20 +130,21 @@ Never commit `.env` or `k8s/secret.yaml` with real credentials.
 
 ### Configuration variables
 
-| Variable                           | Used by          | Purpose                                                                                              |
-| ---------------------------------- | ---------------- | ---------------------------------------------------------------------------------------------------- |
-| `MYSQL_HOST`                       | API/seeder       | MySQL hostname; use `student-mysql` in Docker and `mysql` in Kubernetes.                             |
-| `MYSQL_PORT`                       | API/seeder       | MySQL port, normally `3306`.                                                                         |
-| `MYSQL_DATABASE`                   | API/seeder/MySQL | Database containing metadata and state tables.                                                       |
-| `MYSQL_USER`                       | API/seeder       | MySQL account used by the application.                                                               |
-| `MYSQL_PASSWORD`                   | API/seeder       | Password for `MYSQL_USER`; the MySQL container receives it as `MYSQL_ROOT_PASSWORD` when using root. |
-| `STUDENT_BATCH_SIZE`               | Seeder           | Number of records inserted per transaction batch.                                                    |
-| `STUDENT_SEED_WORKERS`             | Seeder           | Number of state tables seeded concurrently; default is `4`.                                          |
-| `API_USERNAME`                     | API              | Login username for JWT issuance.                                                                     |
-| `API_PASSWORD`                     | API              | Login password for JWT issuance.                                                                     |
-| `JWT_SECRET_KEY`                   | API              | Private signing key; never send it as a bearer token.                                                |
-| `JWT_ACCESS_TOKEN_EXPIRES_MINUTES` | API              | Lifetime of issued access tokens.                                                                    |
-| `API_HOST` / `API_PORT`            | API              | Flask bind address and listening port.                                                               |
+| Variable                           | Used by          | Purpose                                                                                             |
+| ---------------------------------- | ---------------- | --------------------------------------------------------------------------------------------------- |
+| `MYSQL_HOST_TEMPLATE`              | API/seeder/CLI   | Template for per-state SQL server hostname; defaults to `mysql-{state}` (e.g. `mysql-maharashtra`). |
+| `MYSQL_HOST`                       | API/seeder       | Fallback MySQL hostname when `MYSQL_HOST_TEMPLATE` is not used.                                     |
+| `MYSQL_PORT`                       | API/seeder       | MySQL port, normally `3306`.                                                                        |
+| `MYSQL_DATABASE`                   | API/seeder/MySQL | Database name on each state's SQL server (default: `students_db`).                                  |
+| `MYSQL_USER`                       | API/seeder       | MySQL account used by the application (default: `root`).                                            |
+| `MYSQL_PASSWORD`                   | API/seeder       | Password for `MYSQL_USER`.                                                                          |
+| `STUDENT_BATCH_SIZE`               | Seeder           | Number of records inserted per transaction batch (default: `1000`, tuned to `20000` in k8s).        |
+| `STUDENT_SEED_WORKERS`             | Seeder           | Number of state SQL servers seeded concurrently (default: `4`, tuned to `28` in k8s).               |
+| `API_USERNAME`                     | API              | Login username for JWT issuance.                                                                    |
+| `API_PASSWORD`                     | API              | Login password for JWT issuance.                                                                    |
+| `JWT_SECRET_KEY`                   | API              | Private signing key; never send it as a bearer token.                                               |
+| `JWT_ACCESS_TOKEN_EXPIRES_MINUTES` | API              | Lifetime of issued access tokens.                                                                   |
+| `API_HOST` / `API_PORT`            | API              | Flask bind address and listening port.                                                              |
 
 ## Prometheus metrics
 
@@ -207,147 +158,13 @@ The metrics include:
 
 - `student_api_requests_total` — request count labeled by HTTP method, endpoint, and status code.
 - `student_api_response_duration_seconds` — response-time histogram labeled by HTTP method and endpoint.
+- `student_api_active_requests` — current in-flight requests on the API pod.
 
-Prometheus can scrape the endpoint with:
+---
 
-```yaml
-scrape_configs:
-  - job_name: student-api
-    static_configs:
-      - targets: ["localhost:5000"]
-```
+# Running with Kubernetes
 
-# Option 1: Run with Docker
-
-This option uses two containers connected to a shared Docker network:
-
-- `student-mysql` uses the official `mysql:lts-oracle` image.
-- `student-api` uses the application image built from `Dockerfile`.
-
-No Docker Compose is required.
-
-## 1. Build the application image
-
-```powershell
-docker build -t student-api:1.0.0 .
-```
-
-## 2. Create a Docker network
-
-```powershell
-docker network create student-network
-```
-
-If the network already exists, Docker will report that it exists; continue to the next step.
-
-## 3. Start the database container
-
-Do not pass the full `.env` file to MySQL. It contains `MYSQL_USER=root`,
-which the MySQL image rejects because `MYSQL_USER` is reserved for creating a
-non-root user. Configure the root password with `MYSQL_ROOT_PASSWORD` instead:
-
-```powershell
-docker run -d --name student-mysql --network student-network `
-  -e MYSQL_DATABASE=students_db `
-  -e MYSQL_ROOT_PASSWORD=your-mysql-password `
-  -p 3306:3306 `
-  -v student-mysql-data:/var/lib/mysql `
-  mysql:lts-oracle
-```
-
-The named volume is the database's persistent storage. Existing state tables
-and rows are not stored in the application image; they are stored in
-`student-mysql-data`. Keep using the same volume and do not run
-`docker volume rm student-mysql-data` if existing data must be preserved.
-
-Use the same password as `MYSQL_PASSWORD` in `.env`. `MYSQL_PASSWORD` is used
-by the application to connect as `MYSQL_USER`; for the current setup that user
-is `root`, so the application receives the root password through its own
-container environment.
-
-Wait for MySQL:
-
-```powershell
-docker exec student-mysql mysqladmin ping -h 127.0.0.1 -uroot -pyour-mysql-password --wait=60
-```
-
-## 4. Create the schema and seed all state tables
-
-The application container connects to the database through the Docker service name `student-mysql`:
-
-```powershell
-docker run --rm --name student-seeder --network student-network `
-  --env-file .env `
-  -e MYSQL_HOST=student-mysql `
-  -e MYSQL_USER=root `
-  -e MYSQL_PASSWORD=your-mysql-password `
-  student-api:1.0.0 `
-  sh -c "python main.py /database/init/01_students_schema.sql && python /database/seed_students.py --workers 4"
-```
-
-The seeder uses bounded parallelism: each worker owns its own SQLAlchemy
-connection and performs that state's metadata upsert, table creation, row
-count, excess deletion, and missing-row insertion. Different state tables are
-processed concurrently. Increase `--workers` or set
-`STUDENT_SEED_WORKERS` only when the MySQL server has enough CPU, memory, and
-connections. `--batch-size` controls rows per insert batch independently.
-
-Seeding reconciles each table to its target count without recreating it.
-Existing state tables are preserved and counted before insertion. If a table
-has fewer records, only the missing records are added. If it has more records,
-the excess rows with the highest `student_id` values are removed first. A table
-already at the target count is skipped.
-
-## 5. Start the API container
-
-```powershell
-docker run -d --name student-api --network student-network `
-  --env-file .env `
-  -e MYSQL_HOST=student-mysql `
-  -e MYSQL_USER=root `
-  -e MYSQL_PASSWORD=your-mysql-password `
-  -p 5000:5000 `
-  student-api:1.0.0 `
-  python api.py
-```
-
-The Docker API is available at `http://localhost:5000`.
-
-## Stop Docker containers
-
-```powershell
-docker rm -f student-api student-mysql
-docker network rm student-network
-```
-
-Only remove the volume when intentionally deleting all database data:
-
-```powershell
-docker volume rm student-mysql-data
-```
-
-# Option 2: Run with Kubernetes
-
-The Kubernetes configuration creates two Services:
-
-- `mysql`: ClusterIP Service backed by a persistent `mysql:lts-oracle` Deployment.
-- `student-api`: ClusterIP Service backed by the Flask API Deployment.
-
-Seeding runs as a standalone `seed-students` Job that creates the metadata
-schema and one table per Indian state (~23.6M records total) against the
-shared `mysql` Deployment. The Job requests 2 CPU / 2Gi memory (limits 4 CPU /
-4Gi) and runs 28 workers (one per state table) with 20k-row batches so it can
-use that CPU; `mysql` itself is sized to 1-2 CPU / 2-4Gi with a 20Gi volume to
-keep up with concurrent bulk inserts. `student-api`'s `wait-for-seed-job` init
-container polls that Job until it completes before the API container starts,
-instead of re-running the seeding logic itself. Its timeout
-(`SEED_JOB_TIMEOUT_SECONDS`) isn't a fixed guess — it defaults to
-`total_records / SEED_ASSUMED_RECORDS_PER_SECOND + SEED_TIMEOUT_BUFFER_SECONDS`
-(see `app/wait_for_seed_job.py`), so it scales automatically if the dataset
-size (`STUDENT_POPULATION_RATIO` in `app/state_populations.py`) ever changes.
-The Job's own `activeDeadlineSeconds` in `k8s/seed-job.yaml` uses the same
-formula. Non-sensitive settings come from `student-app-config` (`ConfigMap`);
-credentials come from `student-app-secrets` (`Secret`).
+In Kubernetes, each Indian state runs its own MySQL server (`mysql-<state>`), and the Flask API routes requests to the appropriate state server.
 
 ## 1. Build and load the application image
 
@@ -367,102 +184,79 @@ For Minikube:
 minikube image load student-api:1.0.0
 ```
 
-For a remote cluster, push the image to a registry and update the image name in `k8s/api.yaml`.
-
 ## 2. Create the Kubernetes Secret
 
 ```powershell
 Copy-Item k8s\secret.example.yaml k8s\secret.yaml
 ```
 
-Edit `k8s/secret.yaml` and set:
-
-- `MYSQL_PASSWORD`
-- `API_USERNAME`
-- `API_PASSWORD`
-- `JWT_SECRET_KEY`
-
-Apply it:
+Edit `k8s/secret.yaml` with your credentials and apply:
 
 ```powershell
 kubectl apply -f k8s\secret.yaml
 ```
 
-## 3. Deploy the database and application
+## 3. (Optional) Re-generate MySQL manifests
+
+If state definitions or resource tuning change, regenerate `k8s/mysql.yaml`:
+
+```powershell
+python k8s/generate_mysql_manifests.py
+```
+
+## 4. Deploy the distributed platform
 
 ```powershell
 kubectl apply -k k8s
 ```
 
-Check status:
+Check status across all 28 state servers:
 
 ```powershell
-kubectl get pods,services
-kubectl rollout status deployment/mysql
-# Seeding ~23.6M rows can take well over an hour; match the Job's own
-# activeDeadlineSeconds (k8s/seed-job.yaml) rather than a short guess.
-kubectl wait --for=condition=complete job/seed-students --timeout=7200s
-kubectl rollout status deployment/student-api
-kubectl logs job/seed-students
+# View all 28 state MySQL pods
+kubectl get pods -l app=mysql
+
+# Monitor the parallel seeding Job
+kubectl logs -f job/seed-students
+
+# Verify API and forecast service
+kubectl get deployment student-api forecast-service
 ```
 
-## 4. Access the Kubernetes API locally
+## 5. Access the API locally
 
-The API Service is internal to the cluster. Forward it to localhost:
+Forward the API service to localhost:
 
 ```powershell
 kubectl port-forward service/student-api 5000:5000
 ```
 
-The Kubernetes API is then available at `http://localhost:5000`.
+The API is now available at `http://localhost:5000`.
 
-## Remove the Kubernetes deployment
+## Clean up Kubernetes deployment
 
 ```powershell
 kubectl delete -k k8s
 ```
 
-Delete the database data only when required:
+To delete all per-state database storage:
 
 ```powershell
-kubectl delete pvc mysql-data
+kubectl delete pvc -l app=mysql
 ```
 
-## API usage
+---
 
-Both Docker and Kubernetes expose the same Flask API.
+# API usage
 
-### Step 1: Start the API
-
-Choose one environment first:
-
-- Docker: complete the Docker steps above and confirm the API container is running with `docker ps`.
-- Kubernetes: run `kubectl port-forward service/student-api 5000:5000` and keep that terminal open.
-
-All examples below use the base URL `http://localhost:5000`.
+All examples below assume the API is available at `http://localhost:5000`.
 
 ## Swagger documentation
 
-Swagger UI:
+- Swagger UI: `http://localhost:5000/docs/`
+- OpenAPI JSON: `http://localhost:5000/swagger.json`
 
-```text
-http://localhost:5000/docs/
-```
-
-OpenAPI JSON:
-
-```text
-http://localhost:5000/swagger.json
-```
-
-Swagger provides an interactive way to call every endpoint. Open `/docs/`, use
-`POST /api/auth/login` to obtain a token, click **Authorize**, enter `Bearer`
-followed by the token, and then try the protected student endpoints.
-
-### Step 2: Authenticate and save the JWT
-
-Use the same username and password configured in `.env` for Docker or in
-`k8s/secret.yaml` for Kubernetes:
+## Step 1: Authenticate and obtain JWT
 
 ```powershell
 $login = Invoke-RestMethod -Method Post `
@@ -472,124 +266,54 @@ $login = Invoke-RestMethod -Method Post `
 $headers = @{ Authorization = "Bearer $($login.access_token)" }
 ```
 
-The token is valid for the number of minutes configured by
-`JWT_ACCESS_TOKEN_EXPIRES_MINUTES`. Send it on protected requests using the
-`Authorization` header. Use the value returned in `access_token`; do not use
-the `JWT_SECRET_KEY` value as a bearer token. The secret signs tokens and is
-never sent to the API in a request.
-
-If you receive `401 A valid Bearer JWT is required`, request a fresh token and
-make sure the header has exactly this format:
-
-```powershell
-$headers = @{ Authorization = "Bearer $($login.access_token)" }
-```
-
-Do not send an empty token, the word `Bearer` by itself, or the JWT secret.
-
-### Step 3: Check API and database health
+## Step 2: Health check
 
 ```powershell
 Invoke-RestMethod http://localhost:5000/health
 ```
 
-Expected response:
+Response:
 
 ```json
 { "status": "ok" }
 ```
 
-### Step 4: List students
+## Step 3: Query students from a specific state's SQL server
 
-The student list endpoint is paginated. The default page size is 50 and the
-maximum page size is 1,000:
-
-```powershell
-Invoke-RestMethod `
-  -Uri 'http://localhost:5000/api/students?page=1&per_page=10' `
-  -Headers $headers
-```
-
-The response contains a `data` array and pagination metadata:
-
-```json
-{
-  "data": [],
-  "pagination": {
-    "page": 1,
-    "per_page": 10,
-    "total": "sum of all state-table records",
-    "pages": "calculated from total and per_page"
-  }
-}
-```
-
-### Step 5: Filter and sort students
-
-Use `state=maharashtra` to query one state table. If omitted, the API queries
-all state tables. Supported filters are case-insensitive partial matches:
-
-- `first_name`
-- `last_name`
-- `email`
-- `city`
-
-The supported state codes include `maharashtra`, `uttar_pradesh`, `karnataka`,
-and all other Indian states defined in `app/state_populations.py`.
-
-Supported sorting parameters are:
-
-- `sort_by`: an allow-listed student field such as `student_id`, `last_name`, `city`, or `enrollment_date`.
-- `sort_order`: `asc` or `desc`.
-
-Example filtering and sorting one state's table:
+To query a specific state's dedicated SQL server (e.g. Maharashtra), include `state=maharashtra`. This routes directly to `mysql-maharashtra`:
 
 ```powershell
 Invoke-RestMethod `
-  -Uri 'http://localhost:5000/api/students?state=maharashtra&page=1&per_page=25&sort_by=last_name&sort_order=asc' `
+  -Uri 'http://localhost:5000/api/students?state=maharashtra&page=1&per_page=10&sort_by=last_name&sort_order=asc' `
   -Headers $headers
 ```
 
-Student endpoints require a JWT. Invalid or missing tokens return `401`; an
-invalid sort field or request parameter returns `400`.
+## Step 4: Query across all 28 state SQL servers (parallel fan-out)
 
-### Step 7: Execute a SQL script
+Omit the `state` parameter to run a global query across all 28 state SQL servers:
 
-The authenticated SQL endpoint accepts the target database in the request, so
-the API can work with multiple MySQL databases:
+```powershell
+Invoke-RestMethod `
+  -Uri 'http://localhost:5000/api/students?page=1&per_page=20' `
+  -Headers $headers
+```
+
+## Step 5: Get one student from a state SQL server
+
+```powershell
+Invoke-RestMethod `
+  -Uri 'http://localhost:5000/api/students/1?state=maharashtra' `
+  -Headers $headers
+```
+
+## Step 6: Execute SQL script against a state SQL server
+
+The SQL execution endpoint automatically routes the script to the target state's dedicated SQL server:
 
 ```powershell
 $sqlBody = @{
   database = "students_db"
-  sql = "CREATE TABLE IF NOT EXISTS student_maharashtra_notes (note_id INT PRIMARY KEY, note_text VARCHAR(255));"
-  rollback = $false
-} | ConvertTo-Json
-
-Invoke-RestMethod -Method Post `
-  -Uri http://localhost:5000/api/sql/execute `
-  -Headers $headers `
-  -ContentType "application/json" `
-  -Body $sqlBody
-```
-
-The request fields are:
-
-- `database` — required MySQL database/schema name. Only letters, numbers, and underscores are accepted.
-- `sql` — required SQL script. Multiple statements and MySQL `DELIMITER` blocks are supported.
-- `rollback` — optional boolean, default `false`.
-- `rollback_sql` — required when `rollback=true` is used with `ALTER TABLE`; provide the inverse ALTER statement.
-
-`DROP` and `DELETE` are rejected before execution. `CREATE`, `ALTER`, `INSERT`,
-`UPDATE`, and other non-destructive statements are allowed. ALTER operations
-are queued per table so concurrent changes to the same table execute one at a
-time. The response includes `status`, `statement_count`, `started_at`,
-`finished_at`, `duration_ms`, and queued table names.
-
-Example ALTER with an explicit inverse:
-
-```powershell
-$alterBody = @{
-  database = "students_db"
+  state = "maharashtra"
   sql = "ALTER TABLE student_maharashtra RENAME COLUMN city TO city_name;"
   rollback = $true
   rollback_sql = "ALTER TABLE student_maharashtra RENAME COLUMN city_name TO city;"
@@ -599,32 +323,17 @@ Invoke-RestMethod -Method Post `
   -Uri http://localhost:5000/api/sql/execute `
   -Headers $headers `
   -ContentType "application/json" `
-  -Body $alterBody
+  -Body $sqlBody
 ```
 
-MySQL implicitly commits most DDL statements. Therefore an ALTER cannot be
-rolled back by a normal transaction; the optional `rollback_sql` is an explicit
-inverse script that the service executes after the requested ALTER. Do not put
-`DROP` or `DELETE` in the inverse script because the same safety policy applies.
-
-### Step 6: Get one student
-
-```powershell
-Invoke-RestMethod `
-  -Uri 'http://localhost:5000/api/students/1?state=maharashtra' `
-  -Headers $headers
-```
-
-This returns the student with the requested numeric ID from the selected state
-table. Include `?state=maharashtra` because IDs are local to each state table.
-If the ID does not exist, the API returns `404`.
+If `state` is omitted in the request body, the service automatically inspects the SQL script for `student_<state>` table references and routes to the matching state SQL server (`mysql-<state>`).
 
 ### API endpoint summary
 
-| Method | Endpoint                     | Authentication    | Purpose                                   |
-| ------ | ---------------------------- | ----------------- | ----------------------------------------- |
-| `GET`  | `/health`                    | None              | Check API/database availability           |
-| `POST` | `/api/auth/login`            | Username/password | Issue a JWT                               |
-| `GET`  | `/api/students`              | Bearer JWT        | List, filter, sort, and paginate students |
-| `GET`  | `/api/students/{student_id}` | Bearer JWT        | Get one student                           |
-| `POST` | `/api/sql/execute`           | Bearer JWT        | Execute a validated SQL script            |
+| Method | Endpoint                     | Authentication    | Routing Behavior                                                       |
+| ------ | ---------------------------- | ----------------- | ---------------------------------------------------------------------- |
+| `GET`  | `/health`                    | None              | Pings database connectivity                                            |
+| `POST` | `/api/auth/login`            | Username/password | Issues JWT access token                                                |
+| `GET`  | `/api/students`              | Bearer JWT        | Routes to `mysql-<state>` if `?state=` is set; parallel fan-out if not |
+| `GET`  | `/api/students/{student_id}` | Bearer JWT        | Direct lookup on `mysql-<state>` (requires `?state=`)                  |
+| `POST` | `/api/sql/execute`           | Bearer JWT        | Auto-routes to `mysql-<state>` by `state` parameter or table name      |

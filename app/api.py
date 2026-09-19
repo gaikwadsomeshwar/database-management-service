@@ -1,7 +1,9 @@
-"""Authenticated Flask REST API for querying student records."""
+"""Authenticated Flask REST API for querying student records across per-state SQL servers."""
 
+import concurrent.futures
 import logging
 import os
+import threading
 import time
 from functools import wraps
 from pathlib import Path
@@ -29,9 +31,12 @@ from sqlalchemy.exc import SQLAlchemyError
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
+import sys
+sys.path.insert(0, str(PROJECT_ROOT / "app"))
+
 from cluster_status import get_scaling_snapshot  # noqa: E402
 from state_populations import STATE_POPULATIONS  # noqa: E402
-from sql_executor import execute_sql_script  # noqa: E402
+from sql_executor import execute_sql_script, resolve_mysql_host  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -93,7 +98,6 @@ def stop_request_metrics(exception=None):
     ACTIVE_REQUESTS.dec()
 
 
-
 def jwt_required_json(function):
     """Protect a resource method while keeping JWT errors JSON formatted."""
     @wraps(function)
@@ -113,6 +117,7 @@ def jwt_required_json(function):
 
     return wrapped
 
+
 SWAGGER_URL = "/docs"
 API_URL = "/swagger.json"
 swagger_blueprint = get_swaggerui_blueprint(
@@ -123,22 +128,23 @@ swagger_blueprint = get_swaggerui_blueprint(
 app.register_blueprint(swagger_blueprint, url_prefix=SWAGGER_URL)
 
 
-def load_database_url():
-    """Build the MySQL URL used by the API from environment variables."""
-    database_url = os.getenv("DATABASE_URL")
-    if database_url:
-        return database_url
+# ----------------------------------------------------------------------
+# Distributed Per-State Database Engine Management
+# ----------------------------------------------------------------------
+_ENGINES = {}
+_ENGINES_LOCK = threading.Lock()
 
-    host = os.getenv("MYSQL_HOST", "127.0.0.1")
+
+def build_database_url_for_state(state_code=None):
+    """Build MySQL SQLAlchemy connection URL targeting a specific state's SQL server."""
+    host = resolve_mysql_host(state_code)
     port = os.getenv("MYSQL_PORT", "3306")
-    database = os.getenv("MYSQL_DATABASE")
-    username = os.getenv("MYSQL_USER")
+    database = os.getenv("MYSQL_DATABASE", "students_db")
+    username = os.getenv("MYSQL_USER", "root")
     password = os.getenv("MYSQL_PASSWORD")
 
-    if not database or not username or password is None:
-        raise RuntimeError(
-            "MYSQL_DATABASE, MYSQL_USER, and MYSQL_PASSWORD must be configured."
-        )
+    if not username or password is None:
+        raise RuntimeError("MYSQL_USER and MYSQL_PASSWORD must be configured.")
 
     return (
         "mysql+pymysql://"
@@ -147,7 +153,20 @@ def load_database_url():
     )
 
 
-engine = create_engine(load_database_url(), pool_pre_ping=True)
+def get_engine_for_state(state_code=None):
+    """Retrieve or create a cached SQLAlchemy engine for a state's SQL server."""
+    key = state_code.strip().lower() if state_code else "__default__"
+    with _ENGINES_LOCK:
+        if key not in _ENGINES:
+            url = build_database_url_for_state(state_code)
+            _ENGINES[key] = create_engine(
+                url,
+                pool_pre_ping=True,
+                pool_size=5,
+                max_overflow=10,
+                pool_recycle=1800,
+            )
+        return _ENGINES[key]
 
 
 # Columns returned by every state table and exposed by the API.
@@ -179,21 +198,6 @@ def state_table(state_code):
     if state_code is None:
         return None
     return STATE_TABLES.get(state_code.strip().lower())
-
-
-def students_source(selected_state=None):
-    """Build a safe table source for one state or all state tables."""
-    table = state_table(selected_state)
-    if table:
-        return f"`{table}`"
-    if selected_state:
-        raise ValueError("Unsupported state")
-
-    queries = [
-        SELECT_STUDENT_FIELDS + f" FROM `{table_name}`"
-        for table_name in STATE_TABLES.values()
-    ]
-    return "(" + " UNION ALL ".join(queries) + ") AS students"
 
 
 def serialize_student(row):
@@ -230,12 +234,26 @@ class LoginResource(Resource):
         return {"access_token": token}, 200
 
 
+def query_state_students(state_code, table_name, where_clause, parameters, order_by_clause, limit):
+    """Query count and top rows from one state's dedicated SQL server."""
+    eng = get_engine_for_state(state_code)
+    count_sql = text(f"SELECT COUNT(*) FROM `{table_name}` {where_clause}")
+    data_sql = text(
+        SELECT_STUDENT_FIELDS
+        + f" FROM `{table_name}` {where_clause} {order_by_clause} LIMIT :limit"
+    )
+    with eng.connect() as conn:
+        count = conn.execute(count_sql, parameters).scalar_one()
+        rows = conn.execute(data_sql, {**parameters, "limit": limit}).fetchall()
+        return count, rows
+
+
 class StudentListResource(Resource):
     """Return a paginated, filtered, and sorted student collection.
 
-    Use the `state` query parameter with a state code such as `maharashtra` to
-    query one state table, or omit it to query all state tables. Other filters
-    are `first_name`, `last_name`, `email`, and `city`.
+    Use the `state` query parameter (e.g. `maharashtra`) to query that state's
+    dedicated SQL server directly. Omit `state` to query across all 28 state
+    servers concurrently with parallel fan-out.
     """
 
     @jwt_required_json
@@ -253,19 +271,10 @@ class StudentListResource(Resource):
                 return {"message": f"Unsupported sort_by: {sort_by}"}, 400
             if sort_order not in {"asc", "desc"}:
                 return {"message": "sort_order must be asc or desc"}, 400
-            try:
-                source = students_source(selected_state)
-            except ValueError:
-                return {"message": f"Unsupported state: {selected_state}"}, 400
 
             conditions = []
             parameters = {}
-            filter_fields = (
-                "first_name",
-                "last_name",
-                "email",
-                "city",
-            )
+            filter_fields = ("first_name", "last_name", "email", "city")
             for field in filter_fields:
                 value = request.args.get(field)
                 if value:
@@ -273,53 +282,117 @@ class StudentListResource(Resource):
                     parameters[field] = f"%{value}%"
 
             where_clause = f"WHERE {' AND '.join(conditions)}" if conditions else ""
-            offset = (page - 1) * per_page
-            parameters.update({"limit": per_page, "offset": offset})
-            order = "DESC" if sort_order == "desc" else "ASC"
+            order_sql = "DESC" if sort_order == "desc" else "ASC"
+            order_by_clause = f"ORDER BY {sort_by} {order_sql}"
 
-            count_query = text(f"SELECT COUNT(*) FROM {source} {where_clause}")
-            data_query = text(
-                SELECT_STUDENT_FIELDS
-                + f" FROM {source} {where_clause} ORDER BY {sort_by} {order} "
-                "LIMIT :limit OFFSET :offset"
+            # ------------------------------------------------------------------
+            # Scenario A: Targeted single-state query -> direct to that state's SQL server
+            # ------------------------------------------------------------------
+            if selected_state:
+                table = state_table(selected_state)
+                if not table:
+                    return {"message": f"Unsupported state: {selected_state}"}, 400
+
+                state_code = selected_state.strip().lower()
+                eng = get_engine_for_state(state_code)
+                offset = (page - 1) * per_page
+                state_params = {**parameters, "limit": per_page, "offset": offset}
+
+                count_query = text(f"SELECT COUNT(*) FROM `{table}` {where_clause}")
+                data_query = text(
+                    SELECT_STUDENT_FIELDS
+                    + f" FROM `{table}` {where_clause} {order_by_clause} LIMIT :limit OFFSET :offset"
+                )
+
+                with eng.connect() as connection:
+                    total = connection.execute(count_query, state_params).scalar_one()
+                    rows = connection.execute(data_query, state_params).fetchall()
+
+                return {
+                    "data": [serialize_student(row) for row in rows],
+                    "pagination": {
+                        "page": page,
+                        "per_page": per_page,
+                        "total": total,
+                        "pages": (total + per_page - 1) // per_page,
+                    },
+                }, 200
+
+            # ------------------------------------------------------------------
+            # Scenario B: Global query across all 28 state SQL servers (parallel fan-out)
+            # ------------------------------------------------------------------
+            total = 0
+            all_rows = []
+            max_fetch_per_state = page * per_page
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=min(28, len(STATE_TABLES))) as executor:
+                futures = {
+                    executor.submit(
+                        query_state_students,
+                        state_code,
+                        tbl,
+                        where_clause,
+                        parameters,
+                        order_by_clause,
+                        max_fetch_per_state,
+                    ): state_code
+                    for state_code, tbl in STATE_TABLES.items()
+                }
+                for future in concurrent.futures.as_completed(futures):
+                    try:
+                        st_count, st_rows = future.result()
+                        total += st_count
+                        all_rows.extend(st_rows)
+                    except Exception:
+                        st_code = futures[future]
+                        logger.warning("Failed to query state %s during fan-out", st_code, exc_info=True)
+
+            # Sort combined results in Python
+            reverse = (sort_order == "desc")
+            all_rows.sort(
+                key=lambda r: getattr(r, sort_by) or "",
+                reverse=reverse,
             )
 
-            with engine.connect() as connection:
-                total = connection.execute(count_query, parameters).scalar_one()
-                rows = connection.execute(data_query, parameters).fetchall()
+            offset = (page - 1) * per_page
+            paged_rows = all_rows[offset : offset + per_page]
 
             return {
-                "data": [serialize_student(row) for row in rows],
+                "data": [serialize_student(row) for row in paged_rows],
                 "pagination": {
                     "page": page,
                     "per_page": per_page,
                     "total": total,
-                    "pages": (total + per_page - 1) // per_page,
+                    "pages": (total + per_page - 1) // per_page if total else 1,
                 },
             }, 200
+
         except SQLAlchemyError:
             logger.exception("Failed to query students")
             return {"message": "Database query failed"}, 503
 
 
 class StudentResource(Resource):
-    """Return one student by numeric ID from a selected state table."""
+    """Return one student by numeric ID from a selected state's dedicated SQL server."""
 
     @jwt_required_json
     def get(self, student_id):
         selected_state = request.args.get("state")
-        try:
-            source = students_source(selected_state)
-        except ValueError:
-            return {"message": f"Unsupported state: {selected_state}"}, 400
         if not selected_state:
             return {"message": "state query parameter is required"}, 400
+
+        table = state_table(selected_state)
+        if not table:
+            return {"message": f"Unsupported state: {selected_state}"}, 400
+
+        state_code = selected_state.strip().lower()
         try:
-            with engine.connect() as connection:
+            eng = get_engine_for_state(state_code)
+            with eng.connect() as connection:
                 row = connection.execute(
                     text(
                         SELECT_STUDENT_FIELDS
-                        + f" FROM {source} WHERE student_id = :student_id"
+                        + f" FROM `{table}` WHERE student_id = :student_id"
                     ),
                     {"student_id": student_id},
                 ).fetchone()
@@ -327,16 +400,16 @@ class StudentResource(Resource):
                 return {"message": "Student not found"}, 404
             return serialize_student(row), 200
         except SQLAlchemyError:
-            logger.exception("Failed to query student %s", student_id)
+            logger.exception("Failed to query student %s for state %s", student_id, selected_state)
             return {"message": "Database query failed"}, 503
 
 
 class SqlExecutionResource(Resource):
-    """Execute a safe SQL script against a database selected by the request.
+    """Execute a safe SQL script against a state's dedicated SQL server.
 
-    JSON body: ``database``, ``sql``, optional ``rollback`` and ``rollback_sql``.
-    DROP and DELETE are always rejected. ALTER TABLE operations are serialized
-    per table by the executor and return start/end timestamps and duration.
+    JSON body: ``database``, ``sql``, optional ``state``, ``rollback``, and ``rollback_sql``.
+    Automatically routes to the target state's SQL server if ``state`` is provided
+    or if the SQL statements reference a ``student_<state>`` table.
     """
 
     @jwt_required_json
@@ -344,6 +417,7 @@ class SqlExecutionResource(Resource):
         payload = request.get_json(silent=True) or {}
         database = payload.get("database")
         sql_content = payload.get("sql")
+        state = payload.get("state")
         rollback = payload.get("rollback", False)
         rollback_sql = payload.get("rollback_sql")
 
@@ -360,6 +434,7 @@ class SqlExecutionResource(Resource):
                 sql_content=sql_content,
                 rollback=rollback,
                 rollback_sql=rollback_sql,
+                state=state.strip().lower() if isinstance(state, str) and state.strip() else None,
             )
             return result, 200
         except ValueError as error:
@@ -407,7 +482,10 @@ def scaling_status():
 def health():
     """Return API and database availability without requiring authentication."""
     try:
-        with engine.connect() as connection:
+        # Check database connectivity against default or sample state SQL server
+        sample_state = next(iter(STATE_POPULATIONS.keys()))
+        eng = get_engine_for_state(sample_state)
+        with eng.connect() as connection:
             connection.execute(text("SELECT 1"))
         return {"status": "ok"}, 200
     except SQLAlchemyError:
@@ -419,8 +497,8 @@ SWAGGER_SPEC = {
     "openapi": "3.0.3",
     "info": {
         "title": "Student Database API",
-        "version": "1.0.0",
-            "description": "JWT-protected API for querying per-state Indian student tables.",
+        "version": "2.0.0",
+        "description": "JWT-protected API for querying distributed per-state Indian student SQL servers.",
     },
     "servers": [{"url": "http://localhost:5000"}],
     "components": {
@@ -435,7 +513,7 @@ SWAGGER_SPEC = {
     "paths": {
         "/health": {
             "get": {
-                "summary": "Check API/database health",
+                "summary": "Check API and database health",
                 "responses": {"200": {"description": "Healthy"}},
             }
         },
@@ -471,12 +549,12 @@ SWAGGER_SPEC = {
         },
         "/api/students": {
             "get": {
-                "summary": "List, filter, and sort students",
+                "summary": "List, filter, and sort students across per-state SQL servers",
                 "security": [{"bearerAuth": []}],
                 "parameters": [
                     {"name": "page", "in": "query", "schema": {"type": "integer", "default": 1}},
                     {"name": "per_page", "in": "query", "schema": {"type": "integer", "default": 50, "maximum": 1000}},
-                    {"name": "state", "in": "query", "description": "State table code, for example maharashtra.", "schema": {"type": "string"}},
+                    {"name": "state", "in": "query", "description": "State code to query dedicated SQL server (e.g. maharashtra). Omit to query all state servers.", "schema": {"type": "string"}},
                     {"name": "first_name", "in": "query", "schema": {"type": "string"}},
                     {"name": "last_name", "in": "query", "schema": {"type": "string"}},
                     {"name": "email", "in": "query", "schema": {"type": "string"}},
@@ -492,11 +570,11 @@ SWAGGER_SPEC = {
         },
         "/api/students/{student_id}": {
             "get": {
-                "summary": "Get one student",
+                "summary": "Get one student from a specific state's SQL server",
                 "security": [{"bearerAuth": []}],
                 "parameters": [
                     {"name": "student_id", "in": "path", "required": True, "schema": {"type": "integer"}},
-                    {"name": "state", "in": "query", "required": True, "description": "State table code, for example maharashtra.", "schema": {"type": "string"}},
+                    {"name": "state", "in": "query", "required": True, "description": "State code (e.g. maharashtra).", "schema": {"type": "string"}},
                 ],
                 "responses": {
                     "200": {"description": "Student returned"},
@@ -507,8 +585,8 @@ SWAGGER_SPEC = {
         },
         "/api/sql/execute": {
             "post": {
-                "summary": "Execute a safe SQL script",
-                "description": "Requires database and sql. DROP and DELETE are rejected. ALTER TABLE operations are queued per table. Set rollback=true and provide rollback_sql to apply an inverse ALTER.",
+                "summary": "Execute a safe SQL script against a state's dedicated SQL server",
+                "description": "Requires database and sql. Optional state targets specific SQL server. Auto-detected from student_<state> table if omitted. DROP and DELETE are rejected.",
                 "security": [{"bearerAuth": []}],
                 "requestBody": {
                     "required": True,
@@ -519,6 +597,7 @@ SWAGGER_SPEC = {
                                 "required": ["database", "sql"],
                                 "properties": {
                                     "database": {"type": "string", "example": "students_db"},
+                                    "state": {"type": "string", "example": "maharashtra"},
                                     "sql": {"type": "string", "example": "ALTER TABLE student_maharashtra RENAME COLUMN city TO city_name;"},
                                     "rollback": {"type": "boolean", "default": False},
                                     "rollback_sql": {"type": "string", "example": "ALTER TABLE student_maharashtra RENAME COLUMN city_name TO city;"},
@@ -528,7 +607,7 @@ SWAGGER_SPEC = {
                     },
                 },
                 "responses": {
-                    "200": {"description": "SQL executed with timestamps and status"},
+                    "200": {"description": "SQL executed with host, timing, and status"},
                     "400": {"description": "Invalid or forbidden SQL"},
                     "401": {"description": JWT_ERROR_DESCRIPTION},
                     "503": {"description": "Database execution failure"},

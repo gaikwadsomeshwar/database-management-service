@@ -1,4 +1,4 @@
-"""Generate and insert synthetic student records into MySQL."""
+"""Generate and insert synthetic student records across distributed per-state MySQL servers."""
 
 import argparse
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -24,6 +24,7 @@ from state_populations import (  # type: ignore[import-not-found]
     STATE_STUDENT_COUNTS,
     STUDENT_POPULATION_RATIO,
 )
+from sql_executor import resolve_mysql_host  # type: ignore[import-not-found]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -49,9 +50,21 @@ STUDENT_COLUMNS = """
     KEY idx_enrollment_date (enrollment_date)
 """
 
+STATE_METADATA_DDL = """
+CREATE TABLE IF NOT EXISTS state_metadata (
+    state_code VARCHAR(64) NOT NULL,
+    state_name VARCHAR(100) NOT NULL,
+    census_2011_population BIGINT UNSIGNED NOT NULL,
+    assumed_student_ratio DECIMAL(4, 3) NOT NULL,
+    allocated_student_count INT UNSIGNED NOT NULL,
+    PRIMARY KEY (state_code),
+    UNIQUE KEY uq_state_metadata_name (state_name)
+) ENGINE=InnoDB;
+"""
 
-def wait_for_database(engine, attempts=30, delay_seconds=2):
-    """Wait for MySQL to accept connections during container startup."""
+
+def wait_for_database(engine, state_name, attempts=30, delay_seconds=2):
+    """Wait for MySQL server of a given state to accept connections."""
     for attempt in range(1, attempts + 1):
         try:
             with engine.connect() as connection:
@@ -61,7 +74,8 @@ def wait_for_database(engine, attempts=30, delay_seconds=2):
             if attempt == attempts:
                 raise
             logger.warning(
-                "Database is not ready (attempt %d/%d); retrying in %d seconds",
+                "[%s] Database is not ready (attempt %d/%d); retrying in %d seconds",
+                state_name,
                 attempt,
                 attempts,
                 delay_seconds,
@@ -69,20 +83,14 @@ def wait_for_database(engine, attempts=30, delay_seconds=2):
             time.sleep(delay_seconds)
 
 
-def load_database_url():
-    """Build a MySQL SQLAlchemy URL from environment variables."""
-    database_url = os.getenv("DATABASE_URL")
-    if database_url:
-        return database_url
-
-    host = os.getenv("MYSQL_HOST", "127.0.0.1")
+def load_database_url_for_state(state_code):
+    """Build a MySQL SQLAlchemy URL targeting that state's dedicated SQL server."""
+    host = resolve_mysql_host(state_code)
     port = os.getenv("MYSQL_PORT", "3306")
-    database = os.getenv("MYSQL_DATABASE")
-    username = os.getenv("MYSQL_USER")
+    database = os.getenv("MYSQL_DATABASE", "students_db")
+    username = os.getenv("MYSQL_USER", "root")
     password = os.getenv("MYSQL_PASSWORD")
 
-    if not database:
-        raise ValueError("MYSQL_DATABASE must be configured.")
     if not username or password is None:
         raise ValueError("MYSQL_USER and MYSQL_PASSWORD must be configured.")
 
@@ -118,7 +126,7 @@ def build_student(fake):
 
 
 def create_state_table(connection, table_name):
-    """Create one isolated student table for an Indian state."""
+    """Create one isolated student table on that state's dedicated SQL server."""
     connection.exec_driver_sql(
         f"CREATE TABLE IF NOT EXISTS `{table_name}` ({STUDENT_COLUMNS}) ENGINE=InnoDB"
     )
@@ -199,7 +207,6 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
 
 
 def seed_one_state(
-    engine,
     table_name,
     state_name,
     population,
@@ -207,12 +214,18 @@ def seed_one_state(
     batch_size,
     seed,
 ):
-    """Run metadata, DDL, reconciliation, and inserts for one state.
+    """Run metadata, DDL, reconciliation, and inserts for one state's dedicated SQL server.
 
-    Every state owns an independent connection and transaction, allowing all
-    state operations to run concurrently without sharing connections.
+    Connects directly to that state's MySQL server (e.g. mysql-maharashtra),
+    ensuring independent buffer pools, redo logs, and connection pools.
     """
+    state_code = table_name.removeprefix("student_")
+    db_url = load_database_url_for_state(state_code)
+    engine = create_engine(db_url, pool_pre_ping=True)
+    wait_for_database(engine, state_name)
+
     with engine.begin() as connection:
+        connection.exec_driver_sql(STATE_METADATA_DDL)
         connection.execute(
             text(
                 "INSERT INTO state_metadata "
@@ -226,7 +239,7 @@ def seed_one_state(
                 "allocated_student_count = VALUES(allocated_student_count)"
             ),
             {
-                "code": table_name.removeprefix("student_"),
+                "code": state_code,
                 "name": state_name,
                 "population": population,
                 "ratio": STUDENT_POPULATION_RATIO,
@@ -241,18 +254,21 @@ def seed_one_state(
             batch_size,
             seed,
         )
+    engine.dispose()
     return table_name, count, changes
 
 
-def seed_students(batch_size, seed, workers):
-    """Add missing records to all state tables concurrently."""
-    engine = create_engine(
-        load_database_url(),
-        pool_pre_ping=True,
-        pool_size=workers,
-        max_overflow=0,
-    )
-    wait_for_database(engine)
+def seed_students(batch_size, seed, workers, target_state=None):
+    """Add missing records across all or selected state SQL servers concurrently."""
+    if target_state:
+        state_key = target_state.strip().lower().removeprefix("student_")
+        if state_key not in STATE_POPULATIONS:
+            raise ValueError(f"Unknown state code: {target_state}")
+        items = [(state_key, STATE_POPULATIONS[state_key])]
+    else:
+        items = list(STATE_POPULATIONS.items())
+
+    logger.info("Starting student seeding for %d state SQL server(s) with %d workers", len(items), workers)
 
     try:
         executor = ThreadPoolExecutor(max_workers=workers)
@@ -260,7 +276,6 @@ def seed_students(batch_size, seed, workers):
             jobs = [
                 executor.submit(
                     seed_one_state,
-                    engine,
                     f"student_{table_name}",
                     state_name,
                     population,
@@ -268,18 +283,18 @@ def seed_students(batch_size, seed, workers):
                     batch_size,
                     seed,
                 )
-                for table_name, (state_name, population) in STATE_POPULATIONS.items()
+                for table_name, (state_name, population) in items
             ]
             completed = 0
             for future in as_completed(jobs):
                 table_name, count, changes = future.result()
                 completed += 1
                 logger.info(
-                    "Completed state table %s (%d records); %d/%d states finished",
+                    "Completed state server %s (%d records); %d/%d finished",
                     table_name,
                     count,
                     completed,
-                    len(STATE_POPULATIONS),
+                    len(items),
                 )
                 logger.info(
                     "%s changes: inserted=%d deleted=%d",
@@ -293,16 +308,17 @@ def seed_students(batch_size, seed, workers):
         logger.exception("Failed to seed student records")
         raise
 
+    total_records = sum(STATE_STUDENT_COUNTS[t] for t, _ in items)
     logger.info(
-        "Successfully created %d records across %d Indian states",
-        sum(STATE_STUDENT_COUNTS.values()),
-        len(STATE_STUDENT_COUNTS),
+        "Successfully reconciled %d records across %d state SQL server(s)",
+        total_records,
+        len(items),
     )
 
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Create proportional student tables for India's 28 states."
+        description="Seed student records into distributed per-state MySQL servers (one SQL server per state)."
     )
     parser.add_argument(
         "--batch-size",
@@ -322,6 +338,12 @@ def main():
         default=int(os.getenv("STUDENT_SEED_WORKERS", "4")),
         help="Concurrent state-table workers (default: 4).",
     )
+    parser.add_argument(
+        "--state",
+        type=str,
+        default=None,
+        help="Seed an individual state SQL server only (e.g. maharashtra). Omit to seed all 28 states.",
+    )
     args = parser.parse_args()
 
     if args.batch_size < 1:
@@ -330,7 +352,7 @@ def main():
         parser.error("--workers must be greater than zero")
 
     try:
-        seed_students(args.batch_size, args.seed, args.workers)
+        seed_students(args.batch_size, args.seed, args.workers, target_state=args.state)
     except (OSError, ValueError, SQLAlchemyError):
         logger.exception("Student data generation failed")
         return 1

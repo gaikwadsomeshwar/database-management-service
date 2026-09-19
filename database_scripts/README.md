@@ -8,22 +8,31 @@ against **any** generated `student_<state>` table (e.g. `student_maharashtra`,
 
 Every script uses the placeholder token `__STATE_TABLE__` wherever the target
 table name is needed. Before running a script, replace every occurrence of
-`__STATE_TABLE__` with the target table name, then execute it with the CLI
-runner or the `/api/sql/execute` endpoint:
+`__STATE_TABLE__` with the target table name (e.g. `student_maharashtra`), then
+execute it with the CLI runner or the `/api/sql/execute` endpoint:
+
+CLI runner (targeting a specific state's SQL server, or all state servers):
 
 ```powershell
-python app/main.py database_scripts/1/01_add_guardian_contact_columns.sql
+# Target a specific state SQL server (e.g. mysql-maharashtra)
+python app/main.py database_scripts/1/01_add_guardian_contact_columns.sql --state maharashtra
+
+# Or apply across all 28 state SQL servers
+python app/main.py database_scripts/1/01_add_guardian_contact_columns.sql --all-states
 ```
 
-or via the API (`database` must match the connected schema, e.g. `students_db`):
+API execution (auto-routed to that state's dedicated SQL server):
 
 ```json
 POST /api/sql/execute
 {
   "database": "students_db",
-  "sql": "<script contents with __STATE_TABLE__ replaced>"
+  "state": "maharashtra",
+  "sql": "<script contents with __STATE_TABLE__ replaced with student_maharashtra>"
 }
 ```
+
+If `state` is omitted in the JSON body, the service automatically detects the target state from the `student_<state>` table name and routes to the appropriate state SQL server.
 
 ## Rules followed by every script
 

@@ -1,4 +1,4 @@
--- State metadata is shared by the generated per-state student tables.
+-- State metadata schema initialized on each per-state SQL server alongside that state's dedicated student table.
 CREATE TABLE IF NOT EXISTS state_metadata (
     state_code VARCHAR(64) NOT NULL,
     state_name VARCHAR(100) NOT NULL,
