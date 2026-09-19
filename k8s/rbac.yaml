@@ -1,0 +1,67 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: student-api
+---
+# Read-only access so the /dashboard and /api/scaling/status endpoints can
+# report live Deployment/HPA/ScaledObject state; no write verbs are granted.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: student-api-scaling-reader
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list"]
+  - apiGroups: ["autoscaling"]
+    resources: ["horizontalpodautoscalers"]
+    verbs: ["get", "list"]
+  - apiGroups: ["keda.sh"]
+    resources: ["scaledobjects"]
+    verbs: ["get", "list"]
+  # Lets the wait-for-seed-job initContainer poll seed-students' completion.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: student-api-scaling-reader-binding
+subjects:
+  - kind: ServiceAccount
+    name: student-api
+roleRef:
+  kind: Role
+  name: student-api-scaling-reader
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: forecast-service
+---
+# Vertical scaling needs to patch the student-api Deployment's container
+# resources; resourceNames restricts that to only the one Deployment it
+# manages, not every Deployment in the namespace.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: forecast-service-vertical-scaler
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    resourceNames: ["student-api"]
+    verbs: ["get", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: forecast-service-vertical-scaler-binding
+subjects:
+  - kind: ServiceAccount
+    name: forecast-service
+roleRef:
+  kind: Role
+  name: forecast-service-vertical-scaler
+  apiGroup: rbac.authorization.k8s.io

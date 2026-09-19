@@ -29,33 +29,27 @@ spec:
       labels:
         app: student-api
     spec:
-      automountServiceAccountToken: false
+      serviceAccountName: student-api
+      automountServiceAccountToken: true
       initContainers:
-        - name: seed-students
+        - name: wait-for-seed-job
           image: student-api:1.0.0
           imagePullPolicy: IfNotPresent
-          command:
-            - sh
-            - -c
-            - python main.py /database/init/01_students_schema.sql && python /database/seed_students.py
-          envFrom:
-            - configMapRef:
-                name: student-app-config
+          command: ["python", "wait_for_seed_job.py"]
           env:
-            - name: MYSQL_PASSWORD
+            - name: POD_NAMESPACE
               valueFrom:
-                secretKeyRef:
-                  name: student-app-secrets
-                  key: MYSQL_PASSWORD
+                fieldRef:
+                  fieldPath: metadata.namespace
           resources:
             requests:
-              cpu: 100m
-              memory: 256Mi
-              ephemeral-storage: 512Mi
+              cpu: 50m
+              memory: 64Mi
+              ephemeral-storage: 64Mi
             limits:
-              cpu: "1"
-              memory: 1Gi
-              ephemeral-storage: 1Gi
+              cpu: 200m
+              memory: 128Mi
+              ephemeral-storage: 128Mi
       containers:
         - name: api
           image: student-api:1.0.0
@@ -85,6 +79,10 @@ spec:
                 secretKeyRef:
                   name: student-app-secrets
                   key: JWT_SECRET_KEY
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
           ports:
             - name: http
               containerPort: 5000

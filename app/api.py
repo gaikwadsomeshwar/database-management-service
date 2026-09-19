@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, render_template, request
 from flask_jwt_extended import (
     JWTManager,
     create_access_token,
@@ -22,13 +22,14 @@ from flask_jwt_extended.exceptions import (
 from jwt.exceptions import ExpiredSignatureError, InvalidTokenError
 from flask_restful import Api, Resource
 from flask_swagger_ui import get_swaggerui_blueprint
-from prometheus_client import Counter, Histogram, generate_latest
+from prometheus_client import Counter, Gauge, Histogram, generate_latest
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 load_dotenv(PROJECT_ROOT / ".env")
 
+from cluster_status import get_scaling_snapshot  # noqa: E402
 from state_populations import STATE_POPULATIONS  # noqa: E402
 from sql_executor import execute_sql_script  # noqa: E402
 
@@ -48,6 +49,12 @@ API_RESPONSE_TIME = Histogram(
     "HTTP response time for the student API.",
     ("method", "endpoint"),
 )
+# Proxy for request "queue depth": requests currently being handled, used by
+# the proactive scaler's horizontal recommendation as an immediate load signal.
+ACTIVE_REQUESTS = Gauge(
+    "student_api_active_requests",
+    "Number of HTTP requests currently being processed by this pod.",
+)
 
 app = Flask(__name__)
 app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY")
@@ -66,6 +73,7 @@ api = Api(app)
 def start_request_metrics():
     """Start the timer used by the request response-time histogram."""
     request.environ["student_api_request_started"] = time.perf_counter()
+    ACTIVE_REQUESTS.inc()
 
 
 @app.after_request
@@ -77,6 +85,12 @@ def record_request_metrics(response):
     API_REQUESTS.labels(request.method, endpoint, str(response.status_code)).inc()
     API_RESPONSE_TIME.labels(request.method, endpoint).observe(duration)
     return response
+
+
+@app.teardown_request
+def stop_request_metrics(exception=None):
+    """Decrement the in-flight gauge even if the request raised an exception."""
+    ACTIVE_REQUESTS.dec()
 
 
 
@@ -375,6 +389,18 @@ def swagger_spec():
 def metrics():
     """Expose Prometheus metrics for scraping."""
     return generate_latest(), 200, {"Content-Type": "text/plain; version=0.0.4; charset=utf-8"}
+
+
+@app.get("/dashboard")
+def dashboard():
+    """Serve the reactive-vs-proactive autoscaling comparison dashboard."""
+    return render_template("dashboard.html")
+
+
+@app.get("/api/scaling/status")
+def scaling_status():
+    """Return a live snapshot comparing reactive HPA and proactive KEDA scaling."""
+    return jsonify(get_scaling_snapshot()), 200
 
 
 @app.get("/health")

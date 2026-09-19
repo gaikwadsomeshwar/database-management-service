@@ -1,0 +1,29 @@
+# Proactive autoscaler driven by the forecasting service's predicted_replicas
+# metric. Requires KEDA (https://keda.sh) with the Prometheus scaler installed,
+# and Prometheus (k8s/monitoring.yaml) scraping forecast-service on port 5100.
+# KEDA refuses to manage a Deployment that already has an HPA attached, so this
+# file and hpa-reactive.yaml cannot both be applied at the same time — see the
+# "Switching between reactive and proactive scaling" section in README.md.
+apiVersion: keda.sh/v1alpha1
+kind: ScaledObject
+metadata:
+  name: student-api-scaledobject-proactive
+  labels:
+    app: student-api
+    scaling-mode: proactive
+spec:
+  scaleTargetRef:
+    name: student-api
+  minReplicaCount: 1
+  maxReplicaCount: 10
+  cooldownPeriod: 120
+  pollingInterval: 30
+  triggers:
+    - type: prometheus
+      metadata:
+        # Assumes monitoring.yaml is deployed in the same namespace as this
+        # ScaledObject; adjust if Prometheus lives elsewhere.
+        serverAddress: http://prometheus.default.svc.cluster.local:9090
+        query: max(predicted_replicas{job="forecast-service"})
+        threshold: "1"
+        activationThreshold: "0"

@@ -1,0 +1,47 @@
+# Runs the schema creation + student-record seeding once, against the shared
+# `mysql` Deployment, before student-api starts. student-api's initContainer
+# (see api.yaml) waits for this Job to reach Complete rather than re-running
+# the seeding logic itself.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed-students
+spec:
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 3600
+  # ~23.6M rows across 28 state tables at a conservative combined 4000 rows/sec
+  # (23,563,809 / 4000 ≈ 5891s) plus a 20-minute startup/connection buffer.
+  activeDeadlineSeconds: 7200
+  template:
+    metadata:
+      labels:
+        app: seed-students
+    spec:
+      restartPolicy: OnFailure
+      automountServiceAccountToken: false
+      containers:
+        - name: seed-students
+          image: student-api:1.0.0
+          imagePullPolicy: IfNotPresent
+          command:
+            - sh
+            - -c
+            - python main.py /database/init/01_students_schema.sql && python /database/seed_students.py
+          envFrom:
+            - configMapRef:
+                name: student-app-config
+          env:
+            - name: MYSQL_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: student-app-secrets
+                  key: MYSQL_PASSWORD
+          resources:
+            requests:
+              cpu: "2"
+              memory: 2Gi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: "4"
+              memory: 4Gi
+              ephemeral-storage: 2Gi

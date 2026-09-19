@@ -5,6 +5,14 @@ model (see ``forecasting/model.py``) and exposes the predicted load and a
 recommended replica count as Prometheus metrics. KEDA (or a custom metrics
 adapter) can then scale the ``student-api`` Deployment ahead of demand,
 instead of waiting for CPU thresholds to be breached.
+
+The horizontal recommendation blends two signals so neither over- nor
+under-provisions: the forecasted request-rate trend (proactive) and the
+*current* in-flight request queue depth (reactive safety net for sudden
+bursts the forecast hasn't seen yet). A separate vertical-scaling loop
+predicts each replica's own CPU/memory needs and right-sizes the Deployment's
+container resources within configured bounds, so horizontal scale-out never
+compounds with over-provisioned per-pod resources.
 """
 
 import logging
@@ -16,8 +24,9 @@ import time
 from flask import Flask, jsonify
 from prometheus_client import Gauge, generate_latest
 
-from forecasting.data_source import fetch_history
+from forecasting.data_source import fetch_history, fetch_latest
 from forecasting.model import EnsembleForecaster
+from vertical_scaler import maybe_apply_vertical_scaling, recommend_resources
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -30,6 +39,12 @@ REFRESH_INTERVAL_SECONDS = int(os.getenv("FORECAST_REFRESH_SECONDS", "60"))
 MIN_REPLICAS = int(os.getenv("FORECAST_MIN_REPLICAS", "1"))
 MAX_REPLICAS = int(os.getenv("FORECAST_MAX_REPLICAS", "10"))
 TARGET_REQUESTS_PER_REPLICA = float(os.getenv("FORECAST_TARGET_RPS_PER_REPLICA", "20"))
+# Queue-depth (in-flight requests) safety net: how many concurrent in-flight
+# requests one replica should absorb before the queue-based signal kicks in.
+TARGET_ACTIVE_REQUESTS_PER_REPLICA = float(
+    os.getenv("FORECAST_TARGET_ACTIVE_REQUESTS_PER_REPLICA", "5")
+)
+VERTICAL_SCALING_ENABLED = os.getenv("VERTICAL_SCALING_ENABLED", "true").lower() == "true"
 
 PREDICTED_REQUEST_RATE = Gauge(
     "predicted_request_rate",
@@ -37,7 +52,31 @@ PREDICTED_REQUEST_RATE = Gauge(
 )
 PREDICTED_REPLICAS = Gauge(
     "predicted_replicas",
-    "Recommended pod replica count derived from the forecasted request rate.",
+    "Recommended pod replica count blending the forecast and queue depth.",
+)
+REPLICAS_FROM_FORECAST = Gauge(
+    "predicted_replicas_from_forecast",
+    "Replica recommendation derived only from the request-rate forecast.",
+)
+REPLICAS_FROM_QUEUE = Gauge(
+    "predicted_replicas_from_queue",
+    "Replica recommendation derived only from current in-flight queue depth.",
+)
+CURRENT_ACTIVE_REQUESTS = Gauge(
+    "observed_active_requests",
+    "Current in-flight request count observed at forecast time.",
+)
+RECOMMENDED_CPU_MILLICORES = Gauge(
+    "recommended_cpu_millicores",
+    "Predicted per-replica CPU request (millicores) from the vertical-scaling model.",
+)
+RECOMMENDED_MEMORY_MIB = Gauge(
+    "recommended_memory_mib",
+    "Predicted per-replica memory request (MiB) from the vertical-scaling model.",
+)
+VERTICAL_SCALE_APPLIED_TOTAL = Gauge(
+    "vertical_scale_applied_total",
+    "Count of vertical-scaling patches applied to the Deployment.",
 )
 FORECAST_MODEL_ERRORS = Gauge(
     "forecast_model_errors_total",
@@ -46,29 +85,69 @@ FORECAST_MODEL_ERRORS = Gauge(
 
 _state_lock = threading.Lock()
 _latest = {"predicted_request_rate": 0.0, "predicted_replicas": MIN_REPLICAS}
+_vertical_scale_applied_count = 0
 
 
-def _recommend_replicas(predicted_rate):
+def _recommend_replicas_from_forecast(predicted_rate):
     """Convert a forecasted request rate into a bounded replica recommendation."""
     replicas = math.ceil(predicted_rate / TARGET_REQUESTS_PER_REPLICA)
     return max(MIN_REPLICAS, min(MAX_REPLICAS, replicas))
 
 
+def _recommend_replicas_from_queue(active_requests):
+    """Convert the current in-flight request count into a replica recommendation."""
+    replicas = math.ceil(active_requests / TARGET_ACTIVE_REQUESTS_PER_REPLICA)
+    return max(MIN_REPLICAS, min(MAX_REPLICAS, replicas))
+
+
 def run_forecast_cycle():
-    """Fetch history, retrain the ensemble, and publish the latest forecast."""
+    """Fetch history, retrain the ensembles, and publish the latest recommendations."""
+    global _vertical_scale_applied_count
+
     history = fetch_history("request_rate")
     forecaster = EnsembleForecaster().fit(history)
     forecast = forecaster.predict(horizon=FORECAST_HORIZON_STEPS)
     peak_rate = float(max(forecast))
-    replicas = _recommend_replicas(peak_rate)
+    replicas_from_forecast = _recommend_replicas_from_forecast(peak_rate)
+
+    active_requests = fetch_latest("active_requests")
+    replicas_from_queue = _recommend_replicas_from_queue(active_requests)
+
+    # Horizontal: take whichever signal wants more capacity right now, so a
+    # queue spike the forecast hasn't learned yet still triggers scale-out,
+    # while a quiet queue doesn't undercut a forecasted upcoming peak.
+    replicas = max(replicas_from_forecast, replicas_from_queue)
 
     with _state_lock:
         _latest["predicted_request_rate"] = peak_rate
         _latest["predicted_replicas"] = replicas
+        _latest["predicted_replicas_from_forecast"] = replicas_from_forecast
+        _latest["predicted_replicas_from_queue"] = replicas_from_queue
+        _latest["observed_active_requests"] = active_requests
 
     PREDICTED_REQUEST_RATE.set(peak_rate)
     PREDICTED_REPLICAS.set(replicas)
-    logger.info("Forecast cycle: peak_rate=%.2f replicas=%d", peak_rate, replicas)
+    REPLICAS_FROM_FORECAST.set(replicas_from_forecast)
+    REPLICAS_FROM_QUEUE.set(replicas_from_queue)
+    CURRENT_ACTIVE_REQUESTS.set(active_requests)
+    logger.info(
+        "Forecast cycle: peak_rate=%.2f replicas=%d (forecast=%d, queue=%d, active=%.1f)",
+        peak_rate,
+        replicas,
+        replicas_from_forecast,
+        replicas_from_queue,
+        active_requests,
+    )
+
+    if VERTICAL_SCALING_ENABLED:
+        resource_recommendation = recommend_resources(horizon=FORECAST_HORIZON_STEPS)
+        with _state_lock:
+            _latest.update(resource_recommendation)
+        RECOMMENDED_CPU_MILLICORES.set(resource_recommendation["recommended_cpu_millicores"])
+        RECOMMENDED_MEMORY_MIB.set(resource_recommendation["recommended_memory_mib"])
+        if maybe_apply_vertical_scaling(resource_recommendation):
+            _vertical_scale_applied_count += 1
+            VERTICAL_SCALE_APPLIED_TOTAL.set(_vertical_scale_applied_count)
 
 
 def _background_loop():

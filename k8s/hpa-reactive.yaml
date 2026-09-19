@@ -1,0 +1,31 @@
+# Baseline reactive autoscaler (CPU-threshold based), used in the dissertation as
+# the control/comparison group against the proactive KEDA ScaledObject in
+# scaledobject-proactive.yaml. KEDA refuses to manage a Deployment that already
+# has an HPA attached, so only one of the two files may be applied at a time —
+# see the "Switching between reactive and proactive scaling" section in README.md.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: student-api-hpa-reactive
+  labels:
+    app: student-api
+    scaling-mode: reactive
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: student-api
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 0
+    scaleDown:
+      stabilizationWindowSeconds: 300

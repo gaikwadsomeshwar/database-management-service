@@ -30,7 +30,9 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 │   ├── app-config.yaml
 │   ├── forecast-config.yaml
 │   ├── forecast-service.yaml
-│   ├── autoscaling.yaml        # Reactive HPA baseline + proactive KEDA ScaledObject
+│   ├── monitoring.yaml         # In-cluster Prometheus scraping forecast-service/student-api
+│   ├── hpa-reactive.yaml       # Reactive CPU-based HPA (baseline)
+│   ├── scaledobject-proactive.yaml  # KEDA ScaledObject driven by the forecast (enabled by default)
 │   ├── kustomization.yaml
 │   ├── mysql.yaml
 │   ├── secret.example.yaml
@@ -70,19 +72,88 @@ Then check `http://localhost:5100/predict` (JSON) or `http://localhost:5100/metr
 
 ### Comparing reactive vs. proactive scaling in Kubernetes
 
-`k8s/autoscaling.yaml` defines both scaling strategies against the same
-`student-api` Deployment so they can be benchmarked against each other:
+Two autoscalers target the same `student-api` Deployment so they can be
+benchmarked against each other, but **only one may be active at a time** —
+KEDA's admission webhook rejects a `ScaledObject` if an HPA already manages
+the Deployment, and vice versa:
 
-- `student-api-hpa-reactive` — standard CPU-utilization `HorizontalPodAutoscaler`
+- `k8s/hpa-reactive.yaml` — standard CPU-utilization `HorizontalPodAutoscaler`
   (the reactive baseline described in the dissertation).
-- `student-api-scaledobject-proactive` — a [KEDA](https://keda.sh) `ScaledObject`
+- `k8s/scaledobject-proactive.yaml` — a [KEDA](https://keda.sh) `ScaledObject`
   that scales on the `predicted_replicas` metric from `forecast-service`,
-  requiring KEDA with the Prometheus scaler and a Prometheus instance scraping
-  `forecast-service:5100/metrics`.
+  scraped by the in-cluster Prometheus in `k8s/monitoring.yaml`.
 
-Only enable one of the two against the same Deployment at a time; apply/delete
-the relevant manifest with `kubectl apply -f` / `kubectl delete -f` when
-switching between benchmark runs.
+`k8s/kustomization.yaml` includes `scaledobject-proactive.yaml` by default.
+
+#### Install KEDA (one-time, required for the proactive ScaledObject)
+
+The `ScaledObject` kind is a CRD provided by [KEDA](https://keda.sh); it must
+be installed before `kubectl apply -k k8s` will accept `scaledobject-proactive.yaml`:
+
+```powershell
+helm repo add kedacore https://kedacore.github.io/charts
+helm repo update
+kubectl create namespace keda
+helm install keda kedacore/keda --namespace keda
+```
+
+#### Switching between reactive and proactive scaling
+
+Edit `k8s/kustomization.yaml` to reference the manifest you want, then apply.
+Switching requires removing the previously active autoscaler first:
+
+```powershell
+# Switch to reactive (CPU-based) scaling
+kubectl delete -f k8s/scaledobject-proactive.yaml --ignore-not-found
+kubectl apply -f k8s/hpa-reactive.yaml
+
+# Switch back to proactive (forecast-driven) scaling
+kubectl delete -f k8s/hpa-reactive.yaml --ignore-not-found
+kubectl apply -f k8s/scaledobject-proactive.yaml
+```
+
+### Combined horizontal + vertical learning scaler
+
+Autoscaling here isn't "replicate the same pod" — `forecast_service.py` runs
+two complementary learned recommendations every cycle (`FORECAST_REFRESH_SECONDS`,
+default 60s), instead of only ever adding identical, potentially
+over-provisioned copies:
+
+**Horizontal (how many replicas)** blends two signals and takes the max, so
+neither dominates:
+
+- _Proactive_: the request-rate ensemble forecast (`predicted_replicas_from_forecast`).
+- _Reactive safety net_: current in-flight request "queue depth"
+  (`student_api_active_requests`, incremented/decremented per request in
+  `api.py`), converted to replicas via `FORECAST_TARGET_ACTIVE_REQUESTS_PER_REPLICA`
+  (`predicted_replicas_from_queue`) — this catches sudden bursts the trend
+  model hasn't learned yet, without waiting a full forecast cycle.
+
+**Vertical (how big each replica)** forecasts per-replica CPU/memory usage
+(`forecasting/data_source.py` queries per-pod averages, e.g.
+`avg(rate(container_cpu_usage_seconds_total{...}))`) with the same
+Holt-Winters + gradient-boosting ensemble, then `vertical_scaler.py`:
+
+1. Multiplies the forecasted peak by a headroom ratio (`VERTICAL_CPU_HEADROOM_RATIO`,
+   `VERTICAL_MEMORY_HEADROOM_RATIO`, default 1.3x) — enough margin to avoid
+   throttling/OOM without provisioning for a peak that may never happen.
+2. Clamps the result to `VERTICAL_MIN/MAX_CPU_MILLICORES` and
+   `VERTICAL_MIN/MAX_MEMORY_MIB` so a bad prediction can't runaway-provision.
+3. Only patches `student-api`'s container `resources` (which triggers a
+   rolling update, not an in-place resize) if the change exceeds
+   `VERTICAL_CHANGE_THRESHOLD_RATIO` (default 20%) **and** at least
+   `VERTICAL_SCALE_COOLDOWN_SECONDS` (default 600s) have passed since the last
+   patch — this is what keeps cost in check: no thrashing, no restarts for
+   noise-level changes, and resources always stay inside the configured
+   ceiling instead of being over-provisioned "just in case".
+
+All recommendations are exposed as Prometheus gauges (`predicted_replicas`,
+`predicted_replicas_from_forecast`, `predicted_replicas_from_queue`,
+`observed_active_requests`, `recommended_cpu_millicores`,
+`recommended_memory_mib`, `vertical_scale_applied_total`) and via
+`GET /predict` on `forecast-service`, and are visible on the `/dashboard` (see
+below). Vertical scaling can be disabled with `VERTICAL_SCALING_ENABLED=false`
+in `k8s/forecast-config.yaml` if only horizontal scaling is being benchmarked.
 
 ## Configuration
 
@@ -256,7 +327,21 @@ The Kubernetes configuration creates two Services:
 - `mysql`: ClusterIP Service backed by a persistent `mysql:lts-oracle` Deployment.
 - `student-api`: ClusterIP Service backed by the Flask API Deployment.
 
-The API pod has an init container that creates the metadata schema and seeds one table per Indian state before the API starts. Non-sensitive settings come from `student-app-config` (`ConfigMap`); credentials come from `student-app-secrets` (`Secret`).
+Seeding runs as a standalone `seed-students` Job that creates the metadata
+schema and one table per Indian state (~23.6M records total) against the
+shared `mysql` Deployment. The Job requests 2 CPU / 2Gi memory (limits 4 CPU /
+4Gi) and runs 28 workers (one per state table) with 20k-row batches so it can
+use that CPU; `mysql` itself is sized to 1-2 CPU / 2-4Gi with a 20Gi volume to
+keep up with concurrent bulk inserts. `student-api`'s `wait-for-seed-job` init
+container polls that Job until it completes before the API container starts,
+instead of re-running the seeding logic itself. Its timeout
+(`SEED_JOB_TIMEOUT_SECONDS`) isn't a fixed guess — it defaults to
+`total_records / SEED_ASSUMED_RECORDS_PER_SECOND + SEED_TIMEOUT_BUFFER_SECONDS`
+(see `app/wait_for_seed_job.py`), so it scales automatically if the dataset
+size (`STUDENT_POPULATION_RATIO` in `app/state_populations.py`) ever changes.
+The Job's own `activeDeadlineSeconds` in `k8s/seed-job.yaml` uses the same
+formula. Non-sensitive settings come from `student-app-config` (`ConfigMap`);
+credentials come from `student-app-secrets` (`Secret`).
 
 ## 1. Build and load the application image
 
@@ -308,8 +393,11 @@ Check status:
 ```powershell
 kubectl get pods,services
 kubectl rollout status deployment/mysql
+# Seeding ~23.6M rows can take well over an hour; match the Job's own
+# activeDeadlineSeconds (k8s/seed-job.yaml) rather than a short guess.
+kubectl wait --for=condition=complete job/seed-students --timeout=7200s
 kubectl rollout status deployment/student-api
-kubectl logs deployment/student-api -c seed-students
+kubectl logs job/seed-students
 ```
 
 ## 4. Access the Kubernetes API locally

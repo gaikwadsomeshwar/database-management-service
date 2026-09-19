@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>Autoscaling Dashboard - Reactive vs Proactive</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.5.1/dist/chart.umd.min.js"
+        integrity="sha256-SERKgtTty1vsDxll+qzd4Y2cF9swY9BCq62i9wXJ9Uo="
+        crossorigin="anonymous"></script>
+<style>
+  body { font-family: Arial, Helvetica, sans-serif; margin: 0; background: #0f172a; color: #e2e8f0; }
+  header { padding: 1.25rem 2rem; background: #111827; border-bottom: 1px solid #1f2937; }
+  header h1 { margin: 0; font-size: 1.4rem; }
+  main { padding: 1.5rem 2rem; display: grid; gap: 1.5rem; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); }
+  .card { background: #1e293b; border-radius: 10px; padding: 1rem 1.25rem; box-shadow: 0 1px 3px rgba(0,0,0,0.4); }
+  .card h2 { margin: 0 0 0.5rem; font-size: 0.85rem; text-transform: uppercase; color: #94a3b8; letter-spacing: 0.05em; }
+  .card .value { font-size: 1.8rem; font-weight: 700; }
+  .badge { display: inline-block; padding: 0.15rem 0.6rem; border-radius: 999px; font-size: 0.75rem; font-weight: 600; }
+  .badge.on { background: #14532d; color: #86efac; }
+  .badge.off { background: #374151; color: #9ca3af; }
+  .charts { padding: 0 2rem 2rem; display: grid; gap: 1.5rem; grid-template-columns: 1fr 1fr; }
+  .chart-box { background: #1e293b; border-radius: 10px; padding: 1rem; }
+  .chart-box h3 { margin: 0 0 0.75rem; font-size: 1rem; color: #cbd5e1; }
+  @media (max-width: 900px) { .charts { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Proactive vs Reactive Kubernetes Autoscaling</h1>
+</header>
+
+<main>
+  <div class="card">
+    <h2>Active Deployment Replicas</h2>
+    <div class="value" id="deployment-replicas">-</div>
+  </div>
+  <div class="card">
+    <h2>Reactive HPA (CPU-based)</h2>
+    <div class="value"><span id="reactive-badge" class="badge off">inactive</span></div>
+    <div id="reactive-detail" style="margin-top:0.5rem;color:#94a3b8;font-size:0.85rem;"></div>
+  </div>
+  <div class="card">
+    <h2>Proactive ScaledObject (Forecast-driven)</h2>
+    <div class="value"><span id="proactive-badge" class="badge off">inactive</span></div>
+    <div id="proactive-detail" style="margin-top:0.5rem;color:#94a3b8;font-size:0.85rem;"></div>
+  </div>
+  <div class="card">
+    <h2>Predicted Peak Request Rate</h2>
+    <div class="value" id="predicted-rate">-</div>
+  </div>
+  <div class="card">
+    <h2>Actual Request Rate</h2>
+    <div class="value" id="actual-rate">-</div>
+  </div>
+  <div class="card">
+    <h2>Recommended Replicas (Forecast)</h2>
+    <div class="value" id="predicted-replicas">-</div>
+  </div>
+  <div class="card">
+    <h2>In-Flight Requests (Queue Depth)</h2>
+    <div class="value" id="active-requests">-</div>
+    <div id="queue-detail" style="margin-top:0.5rem;color:#94a3b8;font-size:0.85rem;"></div>
+  </div>
+  <div class="card">
+    <h2>Recommended CPU / Replica</h2>
+    <div class="value" id="recommended-cpu">-</div>
+  </div>
+  <div class="card">
+    <h2>Recommended Memory / Replica</h2>
+    <div class="value" id="recommended-memory">-</div>
+  </div>
+</main>
+
+<div class="charts">
+  <div class="chart-box">
+    <h3>Request Rate: Actual vs Forecasted</h3>
+    <canvas id="rateChart" height="220"></canvas>
+  </div>
+  <div class="chart-box">
+    <h3>Replica Count: Running vs Recommended</h3>
+    <canvas id="replicaChart" height="220"></canvas>
+  </div>
+</div>
+
+<script>
+const MAX_POINTS = 30;
+const labels = [];
+const actualRateSeries = [];
+const predictedRateSeries = [];
+const runningReplicaSeries = [];
+const predictedReplicaSeries = [];
+
+function pushPoint(series, value) {
+  series.push(value);
+  if (series.length > MAX_POINTS) series.shift();
+}
+
+const rateChart = new Chart(document.getElementById('rateChart'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Actual req/s', data: actualRateSeries, borderColor: '#38bdf8', tension: 0.3 },
+      { label: 'Forecasted peak req/s', data: predictedRateSeries, borderColor: '#f472b6', tension: 0.3 },
+    ],
+  },
+  options: { responsive: true, animation: false, scales: { y: { beginAtZero: true } } },
+});
+
+const replicaChart = new Chart(document.getElementById('replicaChart'), {
+  type: 'line',
+  data: {
+    labels,
+    datasets: [
+      { label: 'Running replicas', data: runningReplicaSeries, borderColor: '#34d399', stepped: true },
+      { label: 'Recommended replicas', data: predictedReplicaSeries, borderColor: '#fbbf24', stepped: true },
+    ],
+  },
+  options: { responsive: true, animation: false, scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } } },
+});
+
+function setBadge(elementId, isActive) {
+  const el = document.getElementById(elementId);
+  el.textContent = isActive ? 'active' : 'inactive';
+  el.className = 'badge ' + (isActive ? 'on' : 'off');
+}
+
+async function refresh() {
+  try {
+    const response = await fetch('/api/scaling/status');
+    const data = await response.json();
+
+    const deployment = data.deployment || {};
+    const reactive = data.reactive_hpa || { active: false };
+    const proactive = data.proactive_scaledobject || { active: false };
+    const forecast = data.forecast || {};
+    const actualRate = data.actual_request_rate;
+
+    document.getElementById('deployment-replicas').textContent = deployment.current ?? '-';
+    document.getElementById('predicted-rate').textContent =
+      forecast.predicted_request_rate != null ? forecast.predicted_request_rate.toFixed(1) : '-';
+    document.getElementById('actual-rate').textContent =
+      actualRate != null ? actualRate.toFixed(1) : '-';
+    document.getElementById('predicted-replicas').textContent = forecast.predicted_replicas ?? '-';
+    document.getElementById('active-requests').textContent = forecast.observed_active_requests ?? '-';
+    document.getElementById('queue-detail').textContent =
+      forecast.predicted_replicas_from_forecast != null
+        ? `forecast-based: ${forecast.predicted_replicas_from_forecast}, queue-based: ${forecast.predicted_replicas_from_queue}`
+        : '';
+    document.getElementById('recommended-cpu').textContent =
+      forecast.recommended_cpu_millicores != null ? `${forecast.recommended_cpu_millicores}m` : '-';
+    document.getElementById('recommended-memory').textContent =
+      forecast.recommended_memory_mib != null ? `${forecast.recommended_memory_mib}Mi` : '-';
+
+    setBadge('reactive-badge', !!reactive.active);
+    document.getElementById('reactive-detail').textContent = reactive.active
+      ? `current: ${reactive.current_replicas}, desired: ${reactive.desired_replicas}, cpu: ${reactive.current_cpu_utilization ?? '-'}%`
+      : 'not deployed';
+
+    setBadge('proactive-badge', !!proactive.active);
+    document.getElementById('proactive-detail').textContent = proactive.active
+      ? `ready: ${proactive.ready}, scaling active: ${proactive.scaling_active}`
+      : 'not deployed';
+
+    const now = new Date().toLocaleTimeString();
+    labels.push(now);
+    if (labels.length > MAX_POINTS) labels.shift();
+    pushPoint(actualRateSeries, actualRate ?? null);
+    pushPoint(predictedRateSeries, forecast.predicted_request_rate ?? null);
+    pushPoint(runningReplicaSeries, deployment.current ?? null);
+    pushPoint(predictedReplicaSeries, forecast.predicted_replicas ?? null);
+    rateChart.update();
+    replicaChart.update();
+  } catch (error) {
+    console.error('Failed to refresh dashboard', error);
+  }
+}
+
+refresh();
+setInterval(refresh, 5000);
+</script>
+</body>
+</html>

@@ -3,7 +3,13 @@ kind: Kustomization
 resources:
   - app-config.yaml
   - mysql.yaml
+  - rbac.yaml
+  - seed-job.yaml
   - api.yaml
   - forecast-config.yaml
   - forecast-service.yaml
-  - autoscaling.yaml
+  - monitoring.yaml
+  # Only one autoscaler may target student-api at a time (KEDA and the HPA
+  # controller cannot share a Deployment). Proactive is enabled by default;
+  # swap the line below for hpa-reactive.yaml to run the reactive baseline.
+  - scaledobject-proactive.yaml
