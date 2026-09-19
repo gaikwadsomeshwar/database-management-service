@@ -1,4 +1,15 @@
 apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: forecast-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
 kind: Service
 metadata:
   name: forecast-service
@@ -77,3 +88,10 @@ spec:
               cpu: 750m
               memory: 768Mi
               ephemeral-storage: 512Mi
+          volumeMounts:
+            - name: forecast-data
+              mountPath: /var/lib/forecast-data
+      volumes:
+        - name: forecast-data
+          persistentVolumeClaim:
+            claimName: forecast-data

@@ -16,10 +16,13 @@ compounds with over-provisioned per-pod resources.
 """
 
 import logging
+import json
 import math
 import os
 import threading
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 from flask import Flask, jsonify
 from prometheus_client import Gauge, generate_latest
@@ -45,6 +48,14 @@ TARGET_ACTIVE_REQUESTS_PER_REPLICA = float(
     os.getenv("FORECAST_TARGET_ACTIVE_REQUESTS_PER_REPLICA", "5")
 )
 VERTICAL_SCALING_ENABLED = os.getenv("VERTICAL_SCALING_ENABLED", "true").lower() == "true"
+REPORT_DATA_ENABLED = os.getenv("REPORT_DATA_ENABLED", "true").lower() == "true"
+REPORT_DATA_DIR = Path(
+    os.getenv(
+        "REPORT_DATA_DIR",
+        str(Path(__file__).resolve().parent.parent / "Reports_and_Documents" / "runtime_data"),
+    )
+)
+REPORT_DATA_FILE = REPORT_DATA_DIR / os.getenv("REPORT_DATA_FILENAME", "forecast_metrics.jsonl")
 
 PREDICTED_REQUEST_RATE = Gauge(
     "predicted_request_rate",
@@ -86,6 +97,28 @@ FORECAST_MODEL_ERRORS = Gauge(
 _state_lock = threading.Lock()
 _latest = {"predicted_request_rate": 0.0, "predicted_replicas": MIN_REPLICAS}
 _vertical_scale_applied_count = 0
+_report_data_lock = threading.Lock()
+
+
+def _write_report_snapshot(status, **values):
+    """Append one machine-readable forecast-cycle snapshot for later analysis."""
+    if not REPORT_DATA_ENABLED:
+        return
+
+    snapshot = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "status": status,
+        "refresh_interval_seconds": REFRESH_INTERVAL_SECONDS,
+        **values,
+    }
+    try:
+        REPORT_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        with _report_data_lock:
+            with REPORT_DATA_FILE.open("a", encoding="utf-8") as output:
+                output.write(json.dumps(snapshot, sort_keys=True) + "\n")
+    except Exception:
+        # Report-data persistence must never stop autoscaling or the metrics API.
+        logger.warning("Unable to persist report metrics snapshot", exc_info=True)
 
 
 def _recommend_replicas_from_forecast(predicted_rate):
@@ -149,6 +182,18 @@ def run_forecast_cycle():
             _vertical_scale_applied_count += 1
             VERTICAL_SCALE_APPLIED_TOTAL.set(_vertical_scale_applied_count)
 
+    _write_report_snapshot(
+        "success",
+        predicted_request_rate=peak_rate,
+        predicted_replicas=replicas,
+        predicted_replicas_from_forecast=replicas_from_forecast,
+        predicted_replicas_from_queue=replicas_from_queue,
+        observed_active_requests=active_requests,
+        recommended_cpu_millicores=_latest.get("recommended_cpu_millicores"),
+        recommended_memory_mib=_latest.get("recommended_memory_mib"),
+        vertical_scale_applied_total=_vertical_scale_applied_count,
+    )
+
 
 def _background_loop():
     while True:
@@ -156,6 +201,7 @@ def _background_loop():
             run_forecast_cycle()
         except Exception:
             FORECAST_MODEL_ERRORS.inc()
+            _write_report_snapshot("failed", error="forecast_cycle_failed")
             logger.exception("Forecast cycle failed; retaining last known prediction")
         time.sleep(REFRESH_INTERVAL_SECONDS)
 

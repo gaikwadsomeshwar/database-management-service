@@ -11,6 +11,11 @@ data:
   FORECAST_STEP_SECONDS: "60"
   FORECAST_HORIZON_STEPS: "5"
   FORECAST_REFRESH_SECONDS: "60"
+  # Append one JSONL snapshot after every background forecast cycle. The file
+  # is intended for later report analysis and is not used as a scaling input.
+  REPORT_DATA_ENABLED: "true"
+  REPORT_DATA_DIR: "/var/lib/forecast-data"
+  REPORT_DATA_FILENAME: "forecast_metrics.jsonl"
   FORECAST_MIN_REPLICAS: "1"
   FORECAST_MAX_REPLICAS: "10"
   FORECAST_TARGET_RPS_PER_REPLICA: "20"
