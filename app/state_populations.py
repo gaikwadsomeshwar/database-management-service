@@ -43,8 +43,16 @@ def student_count_for_state(population):
     return max(1, round(population * STUDENT_POPULATION_RATIO))
 
 
+# Map 28 Indian states to 7 MySQL servers (4 state databases per server).
+STATE_SERVER_MAP = {
+    state_code: f"mysql-{(index // 4) + 1}"
+    for index, state_code in enumerate(STATE_POPULATIONS.keys())
+}
+
 # Precompute the row count used by the seeder for every state table.
 STATE_STUDENT_COUNTS = {
     table_name: student_count_for_state(population)
     for table_name, (_, population) in STATE_POPULATIONS.items()
 }
+
+

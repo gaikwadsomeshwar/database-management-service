@@ -1,5 +1,5 @@
-# Runs the schema creation + student-record seeding once, against the distributed
-# per-state MySQL servers (one SQL server per Indian state), before student-api starts.
+# Runs the schema creation + student-record seeding once, against the 7 consolidated
+# MySQL servers (hosting 4 state databases per server), before student-api starts.
 # student-api's initContainer (see api.yaml) waits for this Job to reach Complete
 # rather than re-running the seeding logic itself.
 apiVersion: batch/v1

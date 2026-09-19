@@ -1,11 +1,11 @@
 # Student Database Service
 
-This project provides a distributed, sharded database platform with **one dedicated MySQL server per Indian state** (28 independent SQL servers) and a secured Flask REST API with proactive autoscaling. It can run in either:
+This project provides a distributed, sharded database platform with **7 consolidated MySQL servers** (`mysql-1` through `mysql-7`), hosting **4 dedicated state databases per server** (covering all 28 Indian states) and a secured Flask REST API with proactive autoscaling. It can run in either:
 
 - Standalone Docker containers.
 - Kubernetes (Minikube, Kind, or cloud clusters) using the manifests in `k8s/`.
 
-Each state has its own dedicated SQL server instance and Service (e.g. `mysql-maharashtra`, `mysql-andhra-pradesh`), hosting that state's dedicated table, such as `student_maharashtra` and `student_uttar_pradesh`, alongside its metadata schema. This eliminates cross-state lock contention and InnoDB redo-log bottlenecks while keeping state data strictly isolated.
+Each state has its own dedicated MySQL database instance (e.g. `students_db_maharashtra`, `students_db_karnataka`) hosted across 7 SQL servers (`mysql-1` .. `mysql-7`), containing that state's dedicated table, such as `student_maharashtra` and `student_uttar_pradesh`, alongside its metadata schema. This eliminates cross-state lock contention and InnoDB redo-log bottlenecks while keeping state data strictly isolated.
 
 State allocations use Census 2011 population figures. The generator assumes
 2% of each state's population are students and creates
@@ -27,8 +27,8 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 │   ├── init/01_students_schema.sql  # State metadata schema initialized on each SQL server
 │   └── seed_students.py        # Parallel population-proportional per-state seeder
 ├── k8s/
-│   ├── generate_mysql_manifests.py # Manifest generator for all 28 per-state SQL servers
-│   ├── mysql.yaml              # 28 Deployments, Services, and PVCs (one per Indian state)
+│   ├── generate_mysql_manifests.py # Manifest generator for the 7 consolidated SQL servers
+│   ├── mysql.yaml              # 7 Deployments, Services, and PVCs (mysql-1 through mysql-7)
 │   ├── api.yaml                # student-api Deployment and Service
 │   ├── app-config.yaml         # ConfigMap with MYSQL_HOST_TEMPLATE="mysql-{state}"
 │   ├── forecast-config.yaml
@@ -41,22 +41,22 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 │   └── secret.yaml             # local only; ignored by Git
 ├── test_scripts/
 │   ├── run_database_scripts_test.py # Randomized test harness routing SQL across state servers
-│   └── collect_pod_logs.py     # Collects pod logs (including all 28 state MySQL pods)
+│   └── collect_pod_logs.py     # Collects pod logs (including all state MySQL pods)
 ├── Dockerfile
 └── requirements.txt
 ```
 
-## Distributed Per-State SQL Architecture
+## Distributed Consolidated SQL Architecture
 
-Instead of hosting multiple state tables within a single monolithic MySQL pod, the architecture provides **one SQL server per state**:
+Instead of hosting 28 separate standalone MySQL containers or a single monolithic pod, the architecture consolidates database workloads into **7 dedicated MySQL servers**:
 
-1. **State Isolation**: Each Indian state has a dedicated MySQL pod and ClusterIP Service named `mysql-<state>` (e.g. `mysql-maharashtra`, `mysql-karnataka`).
-2. **Resource Right-Sizing**: Each MySQL pod requests `30m CPU` and `120Mi RAM` (limits: `300m CPU`, `512Mi RAM`) with `--innodb-buffer-pool-size=64M`. All 28 pods collectively reserve ~0.84 CPU cores and ~3.3 GB RAM, running comfortably on standard developer machines and Minikube.
-3. **Independent Storage**: Each state server has its own 1Gi `PersistentVolumeClaim` (`mysql-data-<state>`).
+1. **State Isolation**: Each Indian state has a dedicated database (`students_db_<state>`) distributed across 7 MySQL pods and ClusterIP Services (`mysql-1` through `mysql-7`, 4 states per server).
+2. **Resource Right-Sizing**: Each MySQL pod requests `60m CPU` and `240Mi RAM` (limits: `500m CPU`, `768Mi RAM`) with `--innodb-buffer-pool-size=128M`. All 7 pods reserve ~0.42 CPU cores and ~1.68 GB RAM, avoiding CPU spikes and running smoothly on developer machines and Minikube.
+3. **Independent Storage**: Each MySQL server has its own 2Gi `PersistentVolumeClaim` (`mysql-data-1` through `mysql-data-7`).
 4. **Dynamic Routing**:
-   - The Flask API (`app/api.py`) routes single-state queries (`/api/students?state=maharashtra`) directly to `mysql-maharashtra`.
-   - Global queries (`/api/students` without `state`) execute parallel fan-out queries across all 28 state servers via `ThreadPoolExecutor` and aggregate the paginated results.
-   - The SQL executor (`app/sql_executor.py`) automatically detects table references like `student_maharashtra` to target the corresponding SQL server.
+   - The Flask API (`app/api.py`) routes single-state queries (`/api/students?state=maharashtra`) directly to `mysql-4/students_db_maharashtra`.
+   - Global queries (`/api/students` without `state`) execute parallel fan-out queries across all 28 state databases via `ThreadPoolExecutor` and aggregate the paginated results.
+   - The SQL executor (`app/sql_executor.py`) automatically detects table references like `student_maharashtra` to target the corresponding SQL server and database.
 
 ## Proactive autoscaling forecast service
 
@@ -138,9 +138,9 @@ Never commit `.env` or `k8s/secret.yaml` with real credentials.
 | `MYSQL_DATABASE`                   | API/seeder/MySQL | Database name on each state's SQL server (default: `students_db`).                                  |
 | `MYSQL_USER`                       | API/seeder       | MySQL account used by the application (default: `root`).                                            |
 | `MYSQL_PASSWORD`                   | API/seeder       | Password for `MYSQL_USER`.                                                                          |
-| `STUDENT_BATCH_SIZE`               | Seeder           | Number of records inserted per transaction batch (default: `1000`, tuned to `10000` in k8s).        |
-| `STUDENT_SEED_WORKERS`             | Seeder           | Number of worker threads per batch (default: `5`, tuned to `5` in k8s).                             |
-| `STUDENT_STATE_BATCH_SIZE`         | Seeder           | Number of state SQL servers seeded per batch (default: `5`, tuned to `5` in k8s).                   |
+| `STUDENT_BATCH_SIZE`               | Seeder           | Number of records inserted per transaction batch (default: `1000`, tuned to `2000` in k8s).         |
+| `STUDENT_SEED_WORKERS`             | Seeder           | Number of worker threads per batch (default: `4`, tuned to `4` in k8s).                             |
+| `STUDENT_STATE_BATCH_SIZE`         | Seeder           | Number of state databases seeded per batch (default: `4`, tuned to `4` in k8s; 1 server at a time). |
 | `API_USERNAME`                     | API              | Login username for JWT issuance.                                                                    |
 | `API_PASSWORD`                     | API              | Login password for JWT issuance.                                                                    |
 | `JWT_SECRET_KEY`                   | API              | Private signing key; never send it as a bearer token.                                               |

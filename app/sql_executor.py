@@ -13,10 +13,14 @@ import threading
 import time
 from collections import defaultdict
 from datetime import datetime, timezone
+import sys
 from pathlib import Path
-from urllib.parse import quote_plus
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT / "app"))
+from urllib.parse import quote_plus
 from dotenv import load_dotenv
+from state_populations import STATE_SERVER_MAP  # noqa: E402
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -74,6 +78,9 @@ def validate_statements(statements):
             )
 
 
+
+
+
 def infer_state_from_sql(sql_content):
     """Detect the Indian state code from `student_<state>` table references in SQL."""
     match = STUDENT_TABLE_PATTERN.search(sql_content)
@@ -83,14 +90,15 @@ def infer_state_from_sql(sql_content):
 
 
 def resolve_mysql_host(state=None):
-    """Resolve the target MySQL hostname for a given state.
+    """Resolve the target MySQL hostname for a given state across 7 SQL servers.
 
-    In a distributed architecture (one SQL server per state), uses
-    MYSQL_HOST_TEMPLATE (default: `mysql-{state}`) with hyphens.
-    Falls back to MYSQL_HOST if no state is specified or when running in a single-host setup.
+    Maps 28 states into 7 MySQL servers (`mysql-1` through `mysql-7`), with
+    4 state databases hosted per server.
     """
     if state:
         state_code = state.strip().lower().removeprefix("student_")
+        if state_code in STATE_SERVER_MAP:
+            return STATE_SERVER_MAP[state_code]
         state_slug = state_code.replace("_", "-")
         template = os.getenv("MYSQL_HOST_TEMPLATE", "mysql-{state}")
         return template.format(state=state_slug)
@@ -98,9 +106,18 @@ def resolve_mysql_host(state=None):
     return os.getenv("MYSQL_HOST", "127.0.0.1")
 
 
+def resolve_mysql_database(database, state=None):
+    """Resolve the database name for a state on its target SQL server."""
+    if state:
+        state_code = state.strip().lower().removeprefix("student_")
+        return f"{database}_{state_code}"
+    return database
+
+
 def database_url(database, state=None):
-    """Build a connection URL for the database and target state's SQL server."""
-    if not database or not IDENTIFIER_PATTERN.fullmatch(database):
+    """Build a connection URL for the target database and state's SQL server."""
+    target_database = resolve_mysql_database(database, state)
+    if not target_database or not IDENTIFIER_PATTERN.fullmatch(target_database):
         raise ValueError(
             "database must contain only letters, numbers, and underscores."
         )
@@ -116,12 +133,12 @@ def database_url(database, state=None):
     def setting(name, default=None):
         return os.getenv(name, section.get(name.lower(), default))
 
-    # If state is provided or inferred, route to that state's dedicated SQL server.
+    # If state is provided or inferred, route to that state's assigned SQL server.
     if state:
         host = resolve_mysql_host(state)
     else:
         existing_url = setting("DATABASE_URL")
-        if existing_url and database == setting("MYSQL_DATABASE"):
+        if existing_url and target_database == setting("MYSQL_DATABASE"):
             return existing_url
         host = setting("MYSQL_HOST", "127.0.0.1")
 
@@ -134,8 +151,9 @@ def database_url(database, state=None):
     return (
         "mysql+pymysql://"
         f"{quote_plus(username)}:{quote_plus(password)}@"
-        f"{quote_plus(host)}:{quote_plus(port)}/{quote_plus(database)}"
+        f"{quote_plus(host)}:{quote_plus(port)}/{quote_plus(target_database)}"
     )
+
 
 
 def table_for_alter(statement):

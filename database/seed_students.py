@@ -24,7 +24,7 @@ from state_populations import (  # type: ignore[import-not-found]
     STATE_STUDENT_COUNTS,
     STUDENT_POPULATION_RATIO,
 )
-from sql_executor import resolve_mysql_host  # type: ignore[import-not-found]
+from sql_executor import database_url, resolve_mysql_host  # type: ignore[import-not-found]
 
 logging.basicConfig(
     level=logging.INFO,
@@ -83,11 +83,10 @@ def wait_for_database(engine, state_name, attempts=30, delay_seconds=2):
             time.sleep(delay_seconds)
 
 
-def load_database_url_for_state(state_code):
-    """Build a MySQL SQLAlchemy URL targeting that state's dedicated SQL server."""
+def load_server_root_url_for_state(state_code):
+    """Build a MySQL SQLAlchemy URL targeting the state's SQL server host."""
     host = resolve_mysql_host(state_code)
     port = os.getenv("MYSQL_PORT", "3306")
-    database = os.getenv("MYSQL_DATABASE", "students_db")
     username = os.getenv("MYSQL_USER", "root")
     password = os.getenv("MYSQL_PASSWORD")
 
@@ -97,8 +96,14 @@ def load_database_url_for_state(state_code):
     return (
         "mysql+pymysql://"
         f"{quote_plus(username)}:{quote_plus(password)}@"
-        f"{quote_plus(host)}:{quote_plus(port)}/{quote_plus(database)}"
+        f"{quote_plus(host)}:{quote_plus(port)}/"
     )
+
+
+def load_database_url_for_state(state_code):
+    """Build a MySQL SQLAlchemy URL targeting that state's database on its SQL server."""
+    base_db = os.getenv("MYSQL_DATABASE", "students_db")
+    return database_url(base_db, state=state_code)
 
 
 def build_student(fake):
@@ -132,11 +137,11 @@ def create_state_table(connection, table_name):
     )
 
 
-def seed_state(connection, table_name, state_name, count, batch_size, seed):
+def seed_state(engine, table_name, state_name, count, batch_size, seed):
     """Converge one state table to its target count.
 
-    Missing rows are appended. If the table is over the target, rows with the
-    highest student IDs are removed first, treating the end as the newest rows.
+    Missing rows are appended in independent committed transactions per batch.
+    Retries batch inserts if a connection drop occurs.
     """
     insert_student = text(
         f"""
@@ -149,25 +154,26 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
         )
         """
     )
-    create_state_table(connection, table_name)
-    existing_count = connection.execute(
-        text(f"SELECT COUNT(*) FROM `{table_name}`")
-    ).scalar_one()
-    excess_count = max(0, existing_count - count)
+    with engine.begin() as connection:
+        create_state_table(connection, table_name)
+        existing_count = connection.execute(
+            text(f"SELECT COUNT(*) FROM `{table_name}`")
+        ).scalar_one()
+        excess_count = max(0, existing_count - count)
 
-    if excess_count:
-        connection.exec_driver_sql(
-            f"DELETE FROM `{table_name}` "
-            f"ORDER BY student_id DESC LIMIT {excess_count}"
-        )
-        existing_count -= excess_count
-        logger.info(
-            "%s: removed %d excess records from the end; now %d/%d",
-            state_name,
-            excess_count,
-            existing_count,
-            count,
-        )
+        if excess_count:
+            connection.exec_driver_sql(
+                f"DELETE FROM `{table_name}` "
+                f"ORDER BY student_id DESC LIMIT {excess_count}"
+            )
+            existing_count -= excess_count
+            logger.info(
+                "%s: removed %d excess records from the end; now %d/%d",
+                state_name,
+                excess_count,
+                existing_count,
+                count,
+            )
 
     missing_count = max(0, count - existing_count)
 
@@ -196,7 +202,25 @@ def seed_state(connection, table_name, state_name, count, batch_size, seed):
                 f"{table_name}.{index}@example.edu"
             ).lower()
             batch.append(student)
-        connection.execute(insert_student, batch)
+
+        # Execute and commit batch with retry for connection stability
+        for attempt in range(1, 5):
+            try:
+                with engine.begin() as connection:
+                    connection.execute(insert_student, batch)
+                break
+            except SQLAlchemyError as err:
+                if attempt == 4:
+                    raise
+                logger.warning(
+                    "%s: insert batch failed on attempt %d/4 (%s); retrying in %ds...",
+                    state_name,
+                    attempt,
+                    err,
+                    attempt * 3,
+                )
+                time.sleep(attempt * 3)
+
         logger.info(
             "%s: inserted %d/%d student records",
             state_name,
@@ -214,16 +238,39 @@ def seed_one_state(
     batch_size,
     seed,
 ):
-    """Run metadata, DDL, reconciliation, and inserts for one state's dedicated SQL server.
-
-    Connects directly to that state's MySQL server (e.g. mysql-maharashtra),
-    ensuring independent buffer pools, redo logs, and connection pools.
-    """
+    """Run metadata, DDL, reconciliation, and inserts for one state's dedicated SQL server."""
     state_code = table_name.removeprefix("student_")
-    db_url = load_database_url_for_state(state_code)
-    engine = create_engine(db_url, pool_pre_ping=True)
-    wait_for_database(engine, state_name)
+    base_db = os.getenv("MYSQL_DATABASE", "students_db")
+    target_db = f"{base_db}_{state_code}"
 
+    # 1. Connect to host server and ensure state database exists
+    root_url = load_server_root_url_for_state(state_code)
+    root_engine = create_engine(
+        root_url,
+        pool_pre_ping=True,
+        connect_args={
+            "read_timeout": 300,
+            "write_timeout": 300,
+            "connect_timeout": 60,
+        },
+    )
+    wait_for_database(root_engine, state_name)
+    with root_engine.begin() as conn:
+        conn.exec_driver_sql(f"CREATE DATABASE IF NOT EXISTS `{target_db}`")
+    root_engine.dispose()
+
+    # 2. Connect to state database on the host server
+    db_url = load_database_url_for_state(state_code)
+    engine = create_engine(
+        db_url,
+        pool_pre_ping=True,
+        pool_recycle=300,
+        connect_args={
+            "read_timeout": 300,
+            "write_timeout": 300,
+            "connect_timeout": 60,
+        },
+    )
     with engine.begin() as connection:
         connection.exec_driver_sql(STATE_METADATA_DDL)
         connection.execute(
@@ -246,19 +293,20 @@ def seed_one_state(
                 "count": count,
             },
         )
-        changes = seed_state(
-            connection,
-            table_name,
-            state_name,
-            count,
-            batch_size,
-            seed,
-        )
+    changes = seed_state(
+        engine,
+        table_name,
+        state_name,
+        count,
+        batch_size,
+        seed,
+    )
     engine.dispose()
     return table_name, count, changes
 
 
-def seed_students(batch_size, seed, workers, target_state=None, state_batch_size=5):
+
+def seed_students(batch_size, seed, workers, target_state=None, state_batch_size=4):
     """Add missing records across state SQL servers in batches of states."""
     if target_state:
         state_key = target_state.strip().lower().removeprefix("student_")
@@ -353,14 +401,14 @@ def main():
     parser.add_argument(
         "--workers",
         type=int,
-        default=int(os.getenv("STUDENT_SEED_WORKERS", "5")),
-        help="Concurrent state-table workers (default: 5).",
+        default=int(os.getenv("STUDENT_SEED_WORKERS", "4")),
+        help="Concurrent state-table workers (default: 4).",
     )
     parser.add_argument(
         "--state-batch-size",
         type=int,
-        default=int(os.getenv("STUDENT_STATE_BATCH_SIZE", "5")),
-        help="Number of state SQL servers to seed per batch (default: 5).",
+        default=int(os.getenv("STUDENT_STATE_BATCH_SIZE", "4")),
+        help="Number of state databases to seed per batch (default: 4, 1 SQL server at a time).",
     )
     parser.add_argument(
         "--state",

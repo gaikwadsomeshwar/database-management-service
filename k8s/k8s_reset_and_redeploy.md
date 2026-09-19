@@ -32,7 +32,7 @@ kubectl apply -f k8s/app-config.yaml
 kubectl apply -f k8s/secret.yaml
 kubectl apply -f k8s/mysql.yaml
 
-# 2. Wait until all 28 MySQL pods reach Running
+# 2. Wait until all 7 MySQL pods reach Running
 kubectl rollout status deployment -l app.kubernetes.io/component=mysql --timeout=180s
 
 # 3. Apply the seed Job and wait for it to complete

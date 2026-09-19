@@ -36,7 +36,7 @@ sys.path.insert(0, str(PROJECT_ROOT / "app"))
 
 from cluster_status import get_scaling_snapshot  # noqa: E402
 from state_populations import STATE_POPULATIONS  # noqa: E402
-from sql_executor import execute_sql_script, resolve_mysql_host  # noqa: E402
+from sql_executor import database_url, execute_sql_script, resolve_mysql_host  # noqa: E402
 
 logging.basicConfig(
     level=logging.INFO,
@@ -118,8 +118,8 @@ def jwt_required_json(function):
     return wrapped
 
 
-SWAGGER_URL = "/docs"
-API_URL = "/swagger.json"
+SWAGGER_URL = "/api/docs"
+API_URL = "/static/swagger.json"
 swagger_blueprint = get_swaggerui_blueprint(
     SWAGGER_URL,
     API_URL,
@@ -136,21 +136,9 @@ _ENGINES_LOCK = threading.Lock()
 
 
 def build_database_url_for_state(state_code=None):
-    """Build MySQL SQLAlchemy connection URL targeting a specific state's SQL server."""
-    host = resolve_mysql_host(state_code)
-    port = os.getenv("MYSQL_PORT", "3306")
-    database = os.getenv("MYSQL_DATABASE", "students_db")
-    username = os.getenv("MYSQL_USER", "root")
-    password = os.getenv("MYSQL_PASSWORD")
-
-    if not username or password is None:
-        raise RuntimeError("MYSQL_USER and MYSQL_PASSWORD must be configured.")
-
-    return (
-        "mysql+pymysql://"
-        f"{quote_plus(username)}:{quote_plus(password)}@"
-        f"{quote_plus(host)}:{quote_plus(port)}/{quote_plus(database)}"
-    )
+    """Build MySQL SQLAlchemy connection URL targeting a specific state's database & host."""
+    base_database = os.getenv("MYSQL_DATABASE", "students_db")
+    return database_url(base_database, state=state_code)
 
 
 def get_engine_for_state(state_code=None):

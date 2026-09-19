@@ -3,16 +3,16 @@ kind: ConfigMap
 metadata:
   name: student-app-config
 data:
-  # Distributed per-state SQL server template: resolves to mysql-maharashtra, mysql-karnataka, etc.
+  # Consolidated SQL server template: routes states to mysql-1 through mysql-7 (4 state DBs per server)
   MYSQL_HOST_TEMPLATE: "mysql-{state}"
   MYSQL_PORT: "3306"
   MYSQL_DATABASE: students_db
   MYSQL_USER: root
   # Seed configuration: batch size per insert statement, max worker threads, and state batch size.
-  # Seeding processes 5 states at a time (with 5 workers) to prevent Minikube resource contention.
-  STUDENT_BATCH_SIZE: "10000"
-  STUDENT_SEED_WORKERS: "5"
-  STUDENT_STATE_BATCH_SIZE: "5"
+  # Seeding processes 4 states at a time (1 SQL server per batch with 4 workers) to prevent resource contention.
+  STUDENT_BATCH_SIZE: "2000"
+  STUDENT_SEED_WORKERS: "4"
+  STUDENT_STATE_BATCH_SIZE: "4"
   API_HOST: 0.0.0.0
   API_PORT: "5000"
   JWT_ACCESS_TOKEN_EXPIRES_MINUTES: "60"
