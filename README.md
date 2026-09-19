@@ -207,8 +207,36 @@ python k8s/generate_mysql_manifests.py
 
 ## 4. Deploy the distributed platform
 
+### Option A: All-in-One Deployment
+
 ```powershell
 kubectl apply -k k8s
+```
+
+_(Note: `student-api` uses an `initContainer` named `wait-for-seed-job` that automatically blocks the API until `seed-students` Job finishes)._
+
+### Option B: Phased Deployment (Seed DB Before Deploying API)
+
+```powershell
+# 1. Apply MySQL instances and secrets
+kubectl apply -f k8s/app-config.yaml
+kubectl apply -f k8s/secret.yaml
+kubectl apply -f k8s/mysql.yaml
+
+# 2. Wait until MySQL pods reach Running
+kubectl rollout status deployment -l app.kubernetes.io/component=mysql --timeout=180s
+
+# 3. Apply seed Job and wait for completion
+kubectl apply -f k8s/seed-job.yaml
+kubectl wait --for=condition=complete job/seed-students --timeout=7200s
+
+# 4. Deploy API and services once seeding is complete
+kubectl apply -f k8s/rbac.yaml
+kubectl apply -f k8s/api.yaml
+kubectl apply -f k8s/forecast-config.yaml
+kubectl apply -f k8s/forecast-service.yaml
+kubectl apply -f k8s/monitoring.yaml
+kubectl apply -f k8s/hpa-reactive.yaml
 ```
 
 Check status across all 28 state servers:

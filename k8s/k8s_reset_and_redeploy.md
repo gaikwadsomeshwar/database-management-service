@@ -1,84 +1,72 @@
-# Full Reset & Redeploy Procedure for Minikube & Per‑State MySQL Stack
+# Reset & Redeploy Procedure for Minikube & Per‑State MySQL Stack
 
-## 1️⃣ Clean‑up any stray Minikube Docker artifacts
-
-```powershell
-# Remove any leftover Minikube container (if it still exists)
-
-docker ps -a --filter "name=minikube" --format "{{.ID}}" | ForEach-Object { docker rm -f $_ }
-
-# Remove all Docker volumes that Minikube created
-
-docker volume ls --filter "name=minikube" --format "{{.Name}}" | ForEach-Object { docker volume rm $_ }
-
-# Delete the local Minikube profile directory (wipes PVC data, config, cache)
-
-Remove-Item -Recurse -Force "$env:USERPROFILE\.minikube"
-```
-
-## 2️⃣ Start a fresh Minikube instance
+## 1️⃣ Reset Minikube Cluster
 
 ```powershell
-# Adjust resources to match your machine (you have ~12 CPU / 16 GB RAM)
+# Delete existing minikube profile and purge local cluster state
+minikube delete --purge
+
+# Start a fresh Minikube cluster
 minikube start --cpus 4 --memory 8192 --driver docker
-```
 
-Verify the node is Ready:
-
-```powershell
+# Verify the node is Ready
 kubectl get nodes
 ```
 
-## 3️⃣ Deploy the per‑state MySQL manifests
+## 2️⃣ Deploy the per‑state MySQL manifests & Seed Databases
+
+### Option A: All-in-One Deployment
 
 ```powershell
-# Apply the whole k8s directory (kustomization + generated manifests)
+# Apply all manifests at once using Kustomize
 kubectl apply -k k8s
 ```
 
-Confirm the resources are created:
+_(Note: `api.yaml` contains an initContainer `wait-for-seed-job` that automatically holds the API pod until the seed job completes)._
+
+### Option B: Phased Deployment (Seeding BEFORE Deploying API)
 
 ```powershell
+# 1. Apply config, secret, and MySQL instances
+kubectl apply -f k8s/app-config.yaml
+kubectl apply -f k8s/secret.yaml
+kubectl apply -f k8s/mysql.yaml
+
+# 2. Wait until all 28 MySQL pods reach Running
+kubectl rollout status deployment -l app.kubernetes.io/component=mysql --timeout=180s
+
+# 3. Apply the seed Job and wait for it to complete
+kubectl apply -f k8s/seed-job.yaml
+kubectl wait --for=condition=complete job/seed-students --timeout=7200s
+
+# 4. Deploy the API, Forecast service, Monitoring, and Autoscaler
+kubectl apply -f k8s/rbac.yaml
+kubectl apply -f k8s/api.yaml
+kubectl apply -f k8s/forecast-config.yaml
+kubectl apply -f k8s/forecast-service.yaml
+kubectl apply -f k8s/monitoring.yaml
+kubectl apply -f k8s/hpa-reactive.yaml
+```
+
+## 3️⃣ Verify Deployment
+
+```powershell
+# Confirm MySQL pods and PVCs are created and Running
 kubectl get pods -l app.kubernetes.io/component=mysql
 kubectl get pvc -l app.kubernetes.io/component=mysql
 ```
 
-All 28 MySQL pods should reach **Running**.
-
-## 4️⃣ (Optional) Run the seed Job to create schema & seed data
+## 4️⃣ Run the test harness
 
 ```powershell
-kubectl apply -f k8s/seed-job.yaml
-```
-
-Check the job logs:
-
-```powershell
-kubectl logs job/seed-job -n default
-```
-
-## 5️⃣ Run the test harness (apply‑only version)
-
-```powershell
-# Activate the virtual environment if not already active
+# Activate virtual environment
 .\.venv\Scripts\activate
 
-# Example: apply script folders 1‑5 on 10 random states, single iteration
+# Apply migration scripts across random state servers
 python test_scripts/run_database_scripts_test.py --from 1 --to 5 --states 10 --iterations 1
 ```
 
-You should see log lines such as:
-
-```
-[maharashtra] Applying 01_add_guardian_contact_columns.sql
-[maharashtra] Applied 1 scripts successfully
-...
-All 1 iteration(s) completed successfully
-```
-
-No rollback calls are made.
-
-## 6️⃣ Verify end‑to‑end functionality
+## 5️⃣ Verify API Functionality
 
 ```powershell
 # Health check of the Flask API
@@ -89,13 +77,3 @@ curl -X POST http://localhost:5000/api/sql/execute \
      -H "Content-Type: application/json" \
      -d '{"database":"students_db","sql":"SELECT COUNT(*) FROM student_maharashtra;","state":"maharashtra"}'
 ```
-
-A successful JSON response confirms the API can reach the newly‑created MySQL instance.
-
----
-
-**Next actions you may consider**
-
-- Add new migration scripts to `database_scripts/` and re‑run the test harness.
-- Tune MySQL resources in `k8s/generate_mysql_manifests.py` if you need more/less memory or CPU per state.
-- Commit the generated `k8s/mysql.yaml` (or keep the generator script) for reproducible deployments.
