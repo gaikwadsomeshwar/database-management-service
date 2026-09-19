@@ -12,4 +12,5 @@ resources:
   # Only one autoscaler may target student-api at a time (KEDA and the HPA
   # controller cannot share a Deployment). Proactive is enabled by default;
   # swap the line below for hpa-reactive.yaml to run the reactive baseline.
-  - scaledobject-proactive.yaml
+  # - scaledobject-proactive.yaml
+  - hpa-reactive.yaml
