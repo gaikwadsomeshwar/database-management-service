@@ -12,7 +12,7 @@ table name is needed. Before running a script, replace every occurrence of
 runner or the `/api/sql/execute` endpoint:
 
 ```powershell
-python app/main.py DatabaseScripts/1/01_add_guardian_contact_columns.sql
+python app/main.py database_scripts/1/01_add_guardian_contact_columns.sql
 ```
 
 or via the API (`database` must match the connected schema, e.g. `students_db`):

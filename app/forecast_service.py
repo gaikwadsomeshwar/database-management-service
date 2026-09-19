@@ -52,7 +52,7 @@ REPORT_DATA_ENABLED = os.getenv("REPORT_DATA_ENABLED", "true").lower() == "true"
 REPORT_DATA_DIR = Path(
     os.getenv(
         "REPORT_DATA_DIR",
-        str(Path(__file__).resolve().parent.parent / "Reports_and_Documents" / "runtime_data"),
+        str(Path(__file__).resolve().parent.parent / "reports_and_documents" / "runtime_data"),
     )
 )
 REPORT_DATA_FILE = REPORT_DATA_DIR / os.getenv("REPORT_DATA_FILENAME", "forecast_metrics.jsonl")

@@ -20,4 +20,4 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
-Reports_and_Documents/*
+reports_and_documents/*
