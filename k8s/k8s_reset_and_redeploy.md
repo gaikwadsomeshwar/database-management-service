@@ -119,6 +119,9 @@ Both digests must be identical before proceeding. If they differ, repeat Step 2.
 ```powershell
 kubectl rollout restart deployment student-api
 kubectl rollout status deployment student-api
+
+# Optional For all deployments
+kubectl get deployments -o name | ForEach-Object { kubectl rollout restart $_ }
 ```
 
 ### Step 5 — Confirm the new code is live
