@@ -7,19 +7,17 @@ containers, Jobs, or Pods.
 
 `run_database_scripts_test.py`:
 
-1. Picks a random sample of state tables (default 10 of the 28 in
-   `app/state_populations.py`).
-2. For each state, **in parallel**, applies every script in the requested
-   `database_scripts/<N>` folder range, **in order**, via `POST /api/sql/execute`.
-3. Once a state's scripts are all applied, rolls each one back (in reverse
-   order) via the same endpoint's `rollback`/`rollback_sql` fields.
-4. Repeats the whole thing for `--iterations` runs, re-sampling states each time.
+1. Groups the 28 Indian state databases across the **7 consolidated MySQL servers** (`mysql-1` through `mysql-7`).
+2. Samples 1 random state database per server host (for up to `--states` servers, max 7).
+3. Executes the state databases in **parallel** worker threads (`ThreadPoolExecutor`).
+4. Within each state database worker thread, applies every SQL script in the requested `database_scripts/<N>` folder range **strictly sequentially, one script at a time**, via `POST /api/sql/execute`. Execution stops on the first failure for a state.
+5. Repeats the whole run for `--iterations` times, re-sampling states across servers each time.
 
 ## Usage
 
 ```powershell
 python test_scripts/run_database_scripts_test.py --from 1 --to 5
-python test_scripts/run_database_scripts_test.py --from 1 --to 10 --states 15 --iterations 3
+python test_scripts/run_database_scripts_test.py --from 1 --to 10 --states 7 --iterations 3
 ```
 
 Requires the API to be reachable (Docker or `kubectl port-forward service/student-api 5000:5000`)
@@ -27,13 +25,13 @@ and `API_USERNAME`/`API_PASSWORD` set via the project's `.env` or the environmen
 `requests` and `python-dotenv` (already in `requirements.txt`) must be installed
 in the Python environment running this script.
 
-| Flag              | Default                 | Meaning                                                 |
-| ----------------- | ----------------------- | ------------------------------------------------------- |
-| `--from` / `--to` | required                | `database_scripts` folder number range, e.g. `1` to `5` |
-| `--states`        | 10                      | Number of random states per iteration                   |
-| `--iterations`    | 1                       | How many times to repeat the whole run                  |
-| `--base-url`      | `http://localhost:5000` | API base URL (or `API_BASE_URL` env var)                |
-| `--database`      | `students_db`           | Database name sent to `/api/sql/execute`                |
+| Flag              | Default                 | Meaning                                                           |
+| ----------------- | ----------------------- | ----------------------------------------------------------------- |
+| `--from` / `--to` | required                | `database_scripts` folder number range, e.g. `1` to `5`           |
+| `--states`        | `7`                     | Number of servers/states per iteration (1 to 7, default 7, max 7) |
+| `--iterations`    | `1`                     | How many times to repeat the whole run                            |
+| `--base-url`      | `http://localhost:5000` | API base URL (or `API_BASE_URL` env var)                          |
+| `--database`      | `students_db`           | Database name sent to `/api/sql/execute`                          |
 
 ## What "rollback" actually reverts
 

@@ -225,7 +225,7 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Apply a database_scripts folder range to random state DBs (1 per server) in parallel, executing scripts sequentially per state.",
+        description="Apply a database_scripts folder range to random state DBs (1 per server, max 7) in parallel, executing scripts sequentially per state.",
     )
     parser.add_argument(
         "--from", dest="from_folder", type=int, required=True,
@@ -237,7 +237,7 @@ def parse_args():
     )
     parser.add_argument(
         "--states", type=int, default=7,
-        help="Number of servers/states to test per iteration (default 7, 1 DB per server)",
+        help="Number of servers/states to test per iteration (1 to 7, default 7, max 7)",
     )
     parser.add_argument(
         "--iterations", type=int, default=1,
@@ -252,7 +252,10 @@ def parse_args():
         default=os.getenv("TEST_DATABASE", os.getenv("MYSQL_DATABASE", "students_db")),
         help="Database name passed to /api/sql/execute (default students_db)",
     )
-    return parser.parse_args()
+    args = parser.parse_args()
+    if not (1 <= args.states <= 7):
+        parser.error("--states must be between 1 and 7 (maximum 7 SQL servers).")
+    return args
 
 
 def main():
