@@ -119,7 +119,7 @@ def jwt_required_json(function):
 
 
 SWAGGER_URL = "/api/docs"
-API_URL = "/static/swagger.json"
+API_URL = "/swagger.json"
 swagger_blueprint = get_swaggerui_blueprint(
     SWAGGER_URL,
     API_URL,
@@ -443,6 +443,7 @@ api.add_resource(SqlExecutionResource, "/api/sql/execute")
 
 
 @app.get("/swagger.json")
+@app.get("/static/swagger.json")
 def swagger_spec():
     """Serve the OpenAPI document used by Swagger UI."""
     return jsonify(SWAGGER_SPEC)
