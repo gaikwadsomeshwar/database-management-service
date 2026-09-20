@@ -79,9 +79,11 @@ def discover_scripts(from_folder, to_folder):
 class ApiClient:
     """Thin wrapper around the existing login and SQL execution endpoints."""
 
-    def __init__(self, base_url, username, password, timeout=30):
+    def __init__(self, base_url, username, password, timeout=600):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
+
+
         self._username = username
         self._password = password
         self._lock = threading.Lock()
@@ -175,10 +177,26 @@ def select_random_state_per_server(server_count=7):
     return [random.choice(server_groups[srv]) for srv in selected_servers]
 
 
-def run_iteration(client, database, from_folder, to_folder, state_sample_size, explicit_states=None):
-    """Apply all scripts in the folder range in parallel across 1 random state DB per selected server.
+def select_top_populous_state_per_server(server_count=7):
+    """Select the single most populous state database for each of the distinct MySQL servers."""
+    server_groups = defaultdict(list)
+    for state_code, (display_name, population) in STATE_POPULATIONS.items():
+        server_name = STATE_SERVER_MAP[state_code]
+        server_groups[server_name].append((state_code, population))
 
-    If `explicit_states` is provided, those states are used directly (no random sampling).
+    available_servers = sorted(server_groups.keys())[:server_count]
+    return [
+        max(server_groups[srv], key=lambda item: item[1])[0]
+        for srv in available_servers
+    ]
+
+
+
+def run_iteration(client, database, from_folder, to_folder, state_sample_size, explicit_states=None, top_populous=False):
+    """Apply all scripts in the folder range in parallel across 1 state DB per selected server.
+
+    If `explicit_states` is provided, those states are used directly.
+    If `top_populous` is True, selects the most populous state per server.
     State DBs run concurrently in parallel threads, while scripts within each state DB
     are applied strictly sequentially one at a time.
     Returns True only if every state completed cleanly.
@@ -188,6 +206,16 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size, e
         states = explicit_states
         logger.info(
             "Folders %s-%s (%d scripts) against %d explicit state(s): %s",
+            from_folder,
+            to_folder,
+            len(scripts),
+            len(states),
+            ", ".join(states),
+        )
+    elif top_populous:
+        states = select_top_populous_state_per_server(state_sample_size)
+        logger.info(
+            "Folders %s-%s (%d scripts) against %d top populous state(s) (1 DB per server, parallel): %s",
             from_folder,
             to_folder,
             len(scripts),
@@ -204,6 +232,7 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size, e
             len(states),
             ", ".join(states),
         )
+
 
     iteration_ok = True
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(states)) as executor:
@@ -268,6 +297,18 @@ def parse_args():
         default=os.getenv("TEST_DATABASE", os.getenv("MYSQL_DATABASE", "students_db")),
         help="Database name passed to /api/sql/execute (default students_db)",
     )
+    parser.add_argument(
+        "--timeout",
+        type=int,
+        default=int(os.getenv("API_TIMEOUT", "600")),
+        help="HTTP request timeout in seconds for API requests (default 600)",
+    )
+
+    parser.add_argument(
+        "--top-populous",
+        action="store_true",
+        help="Target the single most populous state for each selected server (1 DB per server) instead of random selection.",
+    )
     args = parser.parse_args()
     if not args.state and not (1 <= args.states <= 7):
         parser.error("--states must be between 1 and 7 (maximum 7 SQL servers).")
@@ -291,8 +332,9 @@ def main():
         return 1
 
     try:
-        client = ApiClient(args.base_url, username, password)
+        client = ApiClient(args.base_url, username, password, timeout=args.timeout)
     except requests.RequestException:
+
         logger.exception("Login failed against %s", args.base_url)
         return 1
 
@@ -304,9 +346,10 @@ def main():
         try:
             if not run_iteration(
                 client, args.database, args.from_folder, args.to_folder,
-                args.states, explicit_states=explicit_states
+                args.states, explicit_states=explicit_states, top_populous=args.top_populous
             ):
                 any_failures = True
+
         except Exception:
             # Keep going: a bad iteration shouldn't stop the remaining ones.
             any_failures = True

@@ -87,12 +87,12 @@ spec:
         - name: mysql
           image: mysql:lts-oracle
           args:
-            - --innodb-buffer-pool-size=128M
+            - --innodb-buffer-pool-size=96M
             - --max-connections=100
             - --innodb-redo-log-capacity=134217728
             - --max-allowed-packet=268435456
-            - --net-read-timeout=300
-            - --net-write-timeout=300
+            - --net-read-timeout=600
+            - --net-write-timeout=600
             - --wait-timeout=28800
           ports:
             - name: mysql
@@ -131,12 +131,14 @@ spec:
           resources:
             requests:
               cpu: 60m
-              memory: 240Mi
+              memory: 128Mi
               ephemeral-storage: 256Mi
             limits:
-              cpu: 500m
-              memory: 768Mi
-              ephemeral-storage: 1Gi
+              cpu: 800m
+              memory: 896Mi
+              ephemeral-storage: 2Gi
+
+
       volumes:
         - name: mysql-data
           persistentVolumeClaim:
