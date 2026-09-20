@@ -33,6 +33,23 @@ in the Python environment running this script.
 | `--base-url`      | `http://localhost:5000` | API base URL (or `API_BASE_URL` env var)                          |
 | `--database`      | `students_db`           | Database name sent to `/api/sql/execute`                          |
 
+## Automated Test Driver (`run_test_driver.py`)
+
+To repeatedly execute the test script 1000 times with randomized arguments:
+
+```powershell
+python test_scripts/run_test_driver.py
+python test_scripts/run_test_driver.py --runs 1000 --stop-on-failure
+```
+
+For each run, the driver:
+
+1. Waits for the current run to finish synchronously before launching the next.
+2. Randomly selects `from_folder` (1 to 10) and `to_folder` (`from_folder` to 10).
+3. Randomly selects state database count (`states` from 1 to 7).
+4. Randomly selects iteration count (`iterations` from 100 to 1000).
+5. Appends logs to `logs/test_driver.txt`.
+
 ## What "rollback" actually reverts
 
 `app/sql_executor.py` rejects any `DROP`/`DELETE` statement, so a schema
