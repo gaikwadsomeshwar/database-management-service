@@ -80,18 +80,63 @@ curl -X POST http://localhost:5000/api/sql/execute \
 
 ## 6️⃣ Updating & Rolling Out Code Changes
 
-When Python application code or dependencies in `app/` are updated, rebuild the image and trigger a rolling restart without resetting the database cluster:
+When Python application code or dependencies in `app/` are updated, rebuild the image and trigger a rolling restart without resetting the database cluster.
+
+> **Important**: Always use `--no-cache` when rebuilding. Docker's layer cache preserves stale `.py` files from earlier builds — skipping this causes the old code to remain active even after a rollout restart.
+
+> **Important**: `minikube image load` does **not** replace an existing image with the same tag. You must force-remove the old image from Minikube first, then reload.
+
+### Step 1 — Rebuild with no cache
 
 ```powershell
-# 1. Rebuild the application Docker image
-docker build -t student-api:1.0.0 .
+docker build --no-cache -t student-api:1.0.0 .
+```
 
-# 2. Load the updated image into Minikube
+### Step 2 — Force-replace the image in Minikube
+
+```powershell
+# Remove the old image from Minikube's internal Docker daemon
+minikube ssh -- "docker rmi student-api:1.0.0 --force"
+
+# Load the freshly built image
 minikube image load student-api:1.0.0
+```
 
-# 3. Trigger a rolling restart of the API deployment
+### Step 3 — Verify the image digest matches
+
+```powershell
+# Local image digest (source of truth)
+docker inspect student-api:1.0.0 --format "{{.Id}} {{.Created}}"
+
+# Minikube image digest (must match local)
+minikube ssh -- "docker inspect student-api:1.0.0 --format '{{.Id}} {{.Created}}'"
+```
+
+Both digests must be identical before proceeding. If they differ, repeat Step 2.
+
+### Step 4 — Trigger rolling restart
+
+```powershell
 kubectl rollout restart deployment student-api
-
-# 4. Monitor rollout status until complete
 kubectl rollout status deployment student-api
 ```
+
+### Step 5 — Confirm the new code is live
+
+```powershell
+# Get the new pod name
+kubectl get pods -l app=student-api
+
+# Verify a module-level change (replace with any check relevant to your edit)
+$pod = kubectl get pods -l app=student-api -o jsonpath="{.items[0].metadata.name}"
+kubectl exec $pod -- python -c "import sql_executor; print(sql_executor.FORBIDDEN_PATTERN.pattern)"
+```
+
+### Common pitfalls
+
+| Symptom                                           | Cause                                          | Fix                                                      |
+| ------------------------------------------------- | ---------------------------------------------- | -------------------------------------------------------- |
+| `deployment unchanged` after apply                | Manifest YAML hasn't changed, K8s skips update | Use `kubectl rollout restart` instead of `kubectl apply` |
+| Old code still running after rollout              | Docker used cached layers with stale files     | Rebuild with `--no-cache`                                |
+| Old code still running after `--no-cache` rebuild | Minikube has old image cached under same tag   | `minikube ssh -- "docker rmi ... --force"` then reload   |
+| Swagger `/static/swagger.json` 404                | Stale pod; code fix not deployed yet           | Follow this rollout procedure                            |

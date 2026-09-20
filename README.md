@@ -188,14 +188,58 @@ minikube image load student-api:1.0.0
 
 ### Rolling out API code updates without cluster reset
 
-To apply Python code changes (`app/api.py`, etc.) to a running cluster:
+To apply Python code changes (`app/api.py`, `app/sql_executor.py`, etc.) to a running cluster follow these steps exactly — skipping steps leads to stale code staying active.
+
+> **Important**: Always use `--no-cache`. Docker's layer cache preserves old `.py` files, so a cached rebuild silently keeps the old code.
+
+> **Important**: `minikube image load` does **not** overwrite an existing image with the same tag. Force-remove it first.
+
+**Step 1 — Rebuild with no cache**
 
 ```powershell
-docker build -t student-api:1.0.0 .
+docker build --no-cache -t student-api:1.0.0 .
+```
+
+**Step 2 — Force-replace the image in Minikube**
+
+```powershell
+minikube ssh -- "docker rmi student-api:1.0.0 --force"
 minikube image load student-api:1.0.0
+```
+
+**Step 3 — Verify image digests match**
+
+```powershell
+# Both lines must print the same sha256 hash
+docker inspect student-api:1.0.0 --format "{{.Id}} {{.Created}}"
+minikube ssh -- "docker inspect student-api:1.0.0 --format '{{.Id}} {{.Created}}'"
+```
+
+If digests differ, repeat Step 2.
+
+**Step 4 — Rolling restart**
+
+```powershell
 kubectl rollout restart deployment student-api
 kubectl rollout status deployment student-api
 ```
+
+**Step 5 — Confirm new code is live**
+
+```powershell
+$pod = kubectl get pods -l app=student-api -o jsonpath="{.items[0].metadata.name}"
+kubectl exec $pod -- python -c "import sql_executor; print(sql_executor.FORBIDDEN_PATTERN.pattern)"
+```
+
+**Common pitfalls**
+
+| Symptom                                      | Cause                                      | Fix                                                    |
+| -------------------------------------------- | ------------------------------------------ | ------------------------------------------------------ |
+| `deployment unchanged` after apply           | Manifest YAML unchanged, K8s skips it      | Use `kubectl rollout restart`                          |
+| Old code still running after rollout         | Docker used cached layers with stale files | Rebuild with `--no-cache`                              |
+| Old code persists after `--no-cache` rebuild | Minikube cached old image under same tag   | `minikube ssh -- "docker rmi ... --force"` then reload |
+
+> For a full step-by-step guide including cluster reset see [`k8s/k8s_reset_and_redeploy.md`](k8s/k8s_reset_and_redeploy.md).
 
 ## 2. Create the Kubernetes Secret
 

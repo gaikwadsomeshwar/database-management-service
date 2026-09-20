@@ -224,20 +224,25 @@ def execute_sql_script(database, sql_content, rollback=False, rollback_sql=None,
                 proc_match = CREATE_PROCEDURE_PATTERN.search(statement)
                 if proc_match:
                     proc_name = proc_match.group(1)
-                    connection.exec_driver_sql(f"DROP PROCEDURE IF EXISTS `{proc_name}`")
+                    connection.execute(text(f"DROP PROCEDURE IF EXISTS `{proc_name}`"))
+
 
                 trig_match = CREATE_TRIGGER_PATTERN.search(statement)
                 if trig_match:
                     trig_name = trig_match.group(1)
-                    connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS `{trig_name}`")
+                    connection.execute(text(f"DROP TRIGGER IF EXISTS `{trig_name}`"))
 
-                connection.exec_driver_sql(statement)
+                # Use text() so SQLAlchemy treats the SQL as raw DDL and PyMySQL
+                # does not interpret % characters (e.g. in LIKE CONCAT('%',...,'%'))
+                # as Python format specifiers.
+                connection.execute(text(statement))
 
             if rollback and rollback_sql:
                 rollback_statements = parse_sql_statements(rollback_sql)
                 validate_statements(rollback_statements)
                 for statement in rollback_statements:
-                    connection.exec_driver_sql(statement)
+                    connection.execute(text(statement))
+
                 logger.warning(
                     "Rollback SQL executed by request database=%s host=%s state=%s",
                     database,
