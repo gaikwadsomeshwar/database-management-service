@@ -175,23 +175,35 @@ def select_random_state_per_server(server_count=7):
     return [random.choice(server_groups[srv]) for srv in selected_servers]
 
 
-def run_iteration(client, database, from_folder, to_folder, state_sample_size):
+def run_iteration(client, database, from_folder, to_folder, state_sample_size, explicit_states=None):
     """Apply all scripts in the folder range in parallel across 1 random state DB per selected server.
 
+    If `explicit_states` is provided, those states are used directly (no random sampling).
     State DBs run concurrently in parallel threads, while scripts within each state DB
     are applied strictly sequentially one at a time.
     Returns True only if every state completed cleanly.
     """
     scripts = discover_scripts(from_folder, to_folder)
-    states = select_random_state_per_server(state_sample_size)
-    logger.info(
-        "Folders %s-%s (%d scripts) against %d state(s) (1 DB per server, parallel): %s",
-        from_folder,
-        to_folder,
-        len(scripts),
-        len(states),
-        ", ".join(states),
-    )
+    if explicit_states:
+        states = explicit_states
+        logger.info(
+            "Folders %s-%s (%d scripts) against %d explicit state(s): %s",
+            from_folder,
+            to_folder,
+            len(scripts),
+            len(states),
+            ", ".join(states),
+        )
+    else:
+        states = select_random_state_per_server(state_sample_size)
+        logger.info(
+            "Folders %s-%s (%d scripts) against %d state(s) (1 DB per server, parallel): %s",
+            from_folder,
+            to_folder,
+            len(scripts),
+            len(states),
+            ", ".join(states),
+        )
 
     iteration_ok = True
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(states)) as executor:
@@ -236,8 +248,12 @@ def parse_args():
         help="Last database_scripts folder number to run, e.g. 5",
     )
     parser.add_argument(
+        "--state",
+        help="Target a specific state by code (e.g. maharashtra). Bypasses random selection. Takes priority over --states.",
+    )
+    parser.add_argument(
         "--states", type=int, default=7,
-        help="Number of servers/states to test per iteration (1 to 7, default 7, max 7)",
+        help="Number of servers/states to test per iteration (1 to 7, default 7, max 7). Ignored if --state is set.",
     )
     parser.add_argument(
         "--iterations", type=int, default=1,
@@ -253,8 +269,16 @@ def parse_args():
         help="Database name passed to /api/sql/execute (default students_db)",
     )
     args = parser.parse_args()
-    if not (1 <= args.states <= 7):
+    if not args.state and not (1 <= args.states <= 7):
         parser.error("--states must be between 1 and 7 (maximum 7 SQL servers).")
+    if args.state:
+        state_code = args.state.strip().lower()
+        known = set(STATE_SERVER_MAP.keys())
+        if state_code not in known:
+            parser.error(
+                f"Unknown state '{args.state}'. Valid codes: {', '.join(sorted(known))}"
+            )
+        args.state = state_code
     return args
 
 
@@ -272,12 +296,15 @@ def main():
         logger.exception("Login failed against %s", args.base_url)
         return 1
 
+    explicit_states = [args.state] if args.state else None
+
     any_failures = False
     for iteration in range(1, args.iterations + 1):
         logger.info("=== Iteration %d/%d ===", iteration, args.iterations)
         try:
             if not run_iteration(
-                client, args.database, args.from_folder, args.to_folder, args.states
+                client, args.database, args.from_folder, args.to_folder,
+                args.states, explicit_states=explicit_states
             ):
                 any_failures = True
         except Exception:
