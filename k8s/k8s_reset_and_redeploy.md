@@ -77,3 +77,21 @@ curl -X POST http://localhost:5000/api/sql/execute \
      -H "Content-Type: application/json" \
      -d '{"database":"students_db","sql":"SELECT COUNT(*) FROM student_maharashtra;","state":"maharashtra"}'
 ```
+
+## 6️⃣ Updating & Rolling Out Code Changes
+
+When Python application code or dependencies in `app/` are updated, rebuild the image and trigger a rolling restart without resetting the database cluster:
+
+```powershell
+# 1. Rebuild the application Docker image
+docker build -t student-api:1.0.0 .
+
+# 2. Load the updated image into Minikube
+minikube image load student-api:1.0.0
+
+# 3. Trigger a rolling restart of the API deployment
+kubectl rollout restart deployment student-api
+
+# 4. Monitor rollout status until complete
+kubectl rollout status deployment student-api
+```

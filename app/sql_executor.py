@@ -36,7 +36,18 @@ ALTER_TABLE_PATTERN = re.compile(
     r"^\s*ALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?`?(\w+)`?",
     re.IGNORECASE,
 )
-FORBIDDEN_PATTERN = re.compile(r"\b(DROP|DELETE)\b", re.IGNORECASE)
+FORBIDDEN_PATTERN = re.compile(
+    r"\b(DROP\s+(?:DATABASE|TABLE)|DELETE)\b",
+    re.IGNORECASE,
+)
+CREATE_PROCEDURE_PATTERN = re.compile(
+    r"\bCREATE\s+PROCEDURE\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?",
+    re.IGNORECASE,
+)
+CREATE_TRIGGER_PATTERN = re.compile(
+    r"\bCREATE\s+TRIGGER\s+(?:IF\s+NOT\s+EXISTS\s+)?`?(\w+)`?",
+    re.IGNORECASE,
+)
 STUDENT_TABLE_PATTERN = re.compile(r"\bstudent_([a-z_]+)\b", re.IGNORECASE)
 TABLE_LOCKS = defaultdict(threading.Lock)
 
@@ -210,6 +221,16 @@ def execute_sql_script(database, sql_content, rollback=False, rollback_sql=None,
                     target_state,
                     table_for_alter(statement),
                 )
+                proc_match = CREATE_PROCEDURE_PATTERN.search(statement)
+                if proc_match:
+                    proc_name = proc_match.group(1)
+                    connection.exec_driver_sql(f"DROP PROCEDURE IF EXISTS `{proc_name}`")
+
+                trig_match = CREATE_TRIGGER_PATTERN.search(statement)
+                if trig_match:
+                    trig_name = trig_match.group(1)
+                    connection.exec_driver_sql(f"DROP TRIGGER IF EXISTS `{trig_name}`")
+
                 connection.exec_driver_sql(statement)
 
             if rollback and rollback_sql:

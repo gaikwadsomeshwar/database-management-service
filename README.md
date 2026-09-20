@@ -186,6 +186,17 @@ For Minikube:
 minikube image load student-api:1.0.0
 ```
 
+### Rolling out API code updates without cluster reset
+
+To apply Python code changes (`app/api.py`, etc.) to a running cluster:
+
+```powershell
+docker build -t student-api:1.0.0 .
+minikube image load student-api:1.0.0
+kubectl rollout restart deployment student-api
+kubectl rollout status deployment student-api
+```
+
 ## 2. Create the Kubernetes Secret
 
 ```powershell

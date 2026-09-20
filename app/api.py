@@ -10,7 +10,7 @@ from pathlib import Path
 from urllib.parse import quote_plus
 
 from dotenv import load_dotenv
-from flask import Flask, jsonify, render_template, request
+from flask import Flask, jsonify, redirect, render_template, request
 from flask_jwt_extended import (
     JWTManager,
     create_access_token,
@@ -447,6 +447,14 @@ api.add_resource(SqlExecutionResource, "/api/sql/execute")
 def swagger_spec():
     """Serve the OpenAPI document used by Swagger UI."""
     return jsonify(SWAGGER_SPEC)
+
+
+@app.get("/docs")
+@app.get("/docs/")
+@app.get("/api/docs")
+def docs_redirect():
+    """Redirect alternative documentation routes to /api/docs/."""
+    return redirect("/api/docs/")
 
 
 @app.get("/metrics")

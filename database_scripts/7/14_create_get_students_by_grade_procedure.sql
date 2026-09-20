@@ -4,7 +4,8 @@ DELIMITER $$
 -- Target: any student_<state> table (run after script 03 adds grade_level).
 -- Replace every __STATE_TABLE__ with the target table name (e.g. student_maharashtra).
 -- Procedures have no "IF NOT EXISTS" equivalent in MySQL; run this once per table.
--- No destructive schema-removal or row-removal statements are used.
+DROP PROCEDURE IF EXISTS `sp___STATE_TABLE___get_students_by_grade`$$
+
 CREATE PROCEDURE `sp___STATE_TABLE___get_students_by_grade`(IN p_grade_level VARCHAR(20))
 BEGIN
     SELECT student_id, first_name, last_name, school_name, grade_level
