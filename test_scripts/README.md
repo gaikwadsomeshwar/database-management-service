@@ -35,20 +35,18 @@ in the Python environment running this script.
 
 ## Automated Test Driver (`run_test_driver.py`)
 
-To repeatedly execute the test script 1000 times with randomized arguments:
+Executes `run_database_scripts_test.py` in two distinct testing phases:
 
 ```powershell
 python test_scripts/run_test_driver.py
-python test_scripts/run_test_driver.py --runs 1000 --stop-on-failure
+python test_scripts/run_test_driver.py --stop-on-failure
+python test_scripts/run_test_driver.py --runs-per-state 10 --combinations 5 --runs-per-combo 10
 ```
 
-For each run, the driver:
-
-1. Waits for the current run to finish synchronously before launching the next.
-2. Randomly selects `from_folder` (1 to 10) and `to_folder` (`from_folder` to 10).
-3. Randomly selects state database count (`states` from 1 to 7).
-4. Randomly selects iteration count (`iterations` from 100 to 1000).
-5. Appends logs to `logs/test_driver.txt`.
+1. **Phase 1 (Incremental State Progression)**: Runs the test script sequentially for state counts from `1` up to `7` (100 runs for 1 state, 100 runs for 2 states, ..., 100 runs for 7 states). Each run randomly selects `from_folder` (1..10), `to_folder` (`from_folder`..10), and `iterations` (100..1000).
+2. **Phase 2 (7-State Combination Load Testing)**: Executes `10,000` randomized parameter combinations targeting 7 random state databases (`from_folder` 1..10, `to_folder` `from_folder`..10, `iterations` 100..1000, `states` 7).
+3. Synchronously waits for each run to complete before launching the next.
+4. Appends all logs to `logs/test_driver.txt`.
 
 ## What "rollback" actually reverts
 

@@ -1,10 +1,14 @@
-"""Driver script to run test_scripts/run_database_scripts_test.py repeatedly (default 1000 runs).
+"""Driver script to run test_scripts/run_database_scripts_test.py in two phases.
 
-For each run:
-- Randomly selects from_folder (1 to 10) and to_folder (from_folder to 10).
-- Randomly selects states count (1 to 7).
-- Randomly selects iterations count (100 to 1000).
-- Executes run_database_scripts_test.py synchronously and waits for completion.
+Phase 1: Incremental State Testing
+- Runs the test script for state count = 1 (100 times).
+- Runs for state count = 2 (100 times).
+- Continues sequentially up to state count = 7 (100 times).
+- Each run randomly selects from_folder (1..10), to_folder (from_folder..10), and iterations (100..1000).
+
+Phase 2: 7-State Combination Testing
+- Executes 10,000 randomized parameter combinations targeting 7 states.
+- Each run randomly selects from_folder (1..10), to_folder (from_folder..10), iterations (100..1000), and states (default 7).
 """
 
 import argparse
@@ -38,13 +42,35 @@ TEST_SCRIPT = PROJECT_ROOT / "test_scripts" / "run_database_scripts_test.py"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Driver to run test_scripts/run_database_scripts_test.py repeatedly with randomized parameters."
+        description="Driver to run test_scripts/run_database_scripts_test.py across state progression and 10,000 parameter combinations."
     )
     parser.add_argument(
-        "--runs",
+        "--runs-per-state",
         type=int,
-        default=1000,
-        help="Total number of runs to execute (default: 1000)",
+        default=100,
+        help="Phase 1: Number of runs for each state count 1 to 7 (default: 100)",
+    )
+    parser.add_argument(
+        "--combinations",
+        type=int,
+        default=10000,
+        help="Phase 2: Number of parameter combinations to run (default: 10000)",
+    )
+    parser.add_argument(
+        "--phase2-states",
+        type=int,
+        default=7,
+        help="Phase 2: State database count per iteration (default: 7)",
+    )
+    parser.add_argument(
+        "--skip-phase1",
+        action="store_true",
+        help="Skip Phase 1 (Incremental State Testing)",
+    )
+    parser.add_argument(
+        "--skip-phase2",
+        action="store_true",
+        help="Skip Phase 2 (7-State Combination Load Testing)",
     )
     parser.add_argument(
         "--base-url",
@@ -59,55 +85,109 @@ def parse_args():
     return parser.parse_args()
 
 
+def execute_run(cmd, run_label, base_url, stop_on_failure):
+    logger.info("=== Executing %s ===", run_label)
+    run_start = time.time()
+    result = subprocess.run(cmd)
+    elapsed = time.time() - run_start
+
+    if result.returncode == 0:
+        logger.info("%s PASSED in %.2fs", run_label, elapsed)
+        return True
+    else:
+        logger.error("%s FAILED (exit code %d) in %.2fs", run_label, result.returncode, elapsed)
+        if stop_on_failure:
+            logger.error("Stopping driver due to --stop-on-failure flag.")
+        return False
+
+
 def run_driver():
     args = parse_args()
-    total_runs = args.runs
     passed_runs = 0
     failed_runs = 0
-
-    logger.info("Starting test driver for %d runs against %s", total_runs, args.base_url)
+    global_run_num = 0
 
     start_time = time.time()
 
-    for run_num in range(1, total_runs + 1):
-        from_folder = random.randint(1, 10)
-        to_folder = random.randint(from_folder, 10)
-        states = random.randint(1, 7)
-        iterations = random.randint(100, 1000)
-
-        cmd = [
-            sys.executable,
-            str(TEST_SCRIPT),
-            "--from", str(from_folder),
-            "--to", str(to_folder),
-            "--states", str(states),
-            "--iterations", str(iterations),
-            "--base-url", args.base_url,
-        ]
-
+    # -------------------------------------------------------------------------
+    # Phase 1: Incremental State Testing (States 1 to 7, 100 runs each)
+    # -------------------------------------------------------------------------
+    if not args.skip_phase1:
         logger.info(
-            "=== Run %d/%d: --from %d --to %d --states %d --iterations %d ===",
-            run_num, total_runs, from_folder, to_folder, states, iterations
+            "Starting Phase 1: Testing State Counts 1 to 7 (%d runs per state)",
+            args.runs_per_state,
         )
 
-        run_start = time.time()
-        result = subprocess.run(cmd)
-        elapsed = time.time() - run_start
+        for state_count in range(1, 8):
+            logger.info("--- Phase 1: Testing State Count %d/7 ---", state_count)
+            for run_idx in range(1, args.runs_per_state + 1):
+                global_run_num += 1
+                from_folder = random.randint(1, 10)
+                to_folder = random.randint(from_folder, 10)
+                iterations = random.randint(100, 1000)
 
-        if result.returncode == 0:
-            passed_runs += 1
-            logger.info("Run %d PASSED in %.2fs", run_num, elapsed)
-        else:
-            failed_runs += 1
-            logger.error("Run %d FAILED (exit code %d) in %.2fs", run_num, result.returncode, elapsed)
-            if args.stop_on_failure:
-                logger.error("Stopping driver due to --stop-on-failure flag.")
+                cmd = [
+                    sys.executable,
+                    str(TEST_SCRIPT),
+                    "--from", str(from_folder),
+                    "--to", str(to_folder),
+                    "--states", str(state_count),
+                    "--iterations", str(iterations),
+                    "--base-url", args.base_url,
+                ]
+
+                run_label = f"Phase 1 (States {state_count}) Run {run_idx}/{args.runs_per_state} (Global #{global_run_num}): --from {from_folder} --to {to_folder} --iterations {iterations}"
+                success = execute_run(cmd, run_label, args.base_url, args.stop_on_failure)
+
+                if success:
+                    passed_runs += 1
+                else:
+                    failed_runs += 1
+                    if args.stop_on_failure:
+                        break
+            if failed_runs > 0 and args.stop_on_failure:
                 break
+
+    # -------------------------------------------------------------------------
+    # Phase 2: 7-State Combination Testing (10,000 combinations)
+    # -------------------------------------------------------------------------
+    if not args.skip_phase2 and not (failed_runs > 0 and args.stop_on_failure):
+        logger.info(
+            "Starting Phase 2: Testing %d Combinations for %d random states",
+            args.combinations,
+            args.phase2_states,
+        )
+
+        for combo_idx in range(1, args.combinations + 1):
+            global_run_num += 1
+            from_folder = random.randint(1, 10)
+            to_folder = random.randint(from_folder, 10)
+            iterations = random.randint(100, 1000)
+
+            cmd = [
+                sys.executable,
+                str(TEST_SCRIPT),
+                "--from", str(from_folder),
+                "--to", str(to_folder),
+                "--states", str(args.phase2_states),
+                "--iterations", str(iterations),
+                "--base-url", args.base_url,
+            ]
+
+            run_label = f"Phase 2 Combo {combo_idx}/{args.combinations} (Global #{global_run_num}): --from {from_folder} --to {to_folder} --states {args.phase2_states} --iterations {iterations}"
+            success = execute_run(cmd, run_label, args.base_url, args.stop_on_failure)
+
+            if success:
+                passed_runs += 1
+            else:
+                failed_runs += 1
+                if args.stop_on_failure:
+                    break
 
     total_elapsed = time.time() - start_time
     logger.info(
-        "=== Driver Finished: Total Runs: %d, Passed: %d, Failed: %d (Total time: %.2fs) ===",
-        run_num, passed_runs, failed_runs, total_elapsed
+        "=== Driver Finished: Total Executed Runs: %d, Passed: %d, Failed: %d (Total time: %.2fs) ===",
+        global_run_num, passed_runs, failed_runs, total_elapsed
     )
 
     if failed_runs > 0:
@@ -116,4 +196,3 @@ def run_driver():
 
 if __name__ == "__main__":
     run_driver()
-

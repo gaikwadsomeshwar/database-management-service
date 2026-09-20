@@ -41,7 +41,7 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 │   └── secret.yaml             # local only; ignored by Git
 ├── test_scripts/
 │   ├── run_database_scripts_test.py # Parallel test harness routing SQL across state servers (max 7 states)
-│   ├── run_test_driver.py      # Automated driver running test script 1000x with randomized parameters
+│   ├── run_test_driver.py      # Automated two-phase test driver (1..7 states progression + 100 combinations load test)
 │   └── collect_pod_logs.py     # Collects pod logs (including all state MySQL pods)
 ├── Dockerfile
 └── requirements.txt
