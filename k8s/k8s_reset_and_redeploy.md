@@ -62,8 +62,8 @@ kubectl get pvc -l app.kubernetes.io/component=mysql
 # Activate virtual environment
 .\.venv\Scripts\activate
 
-# Apply migration scripts across random state servers
-python test_scripts/run_database_scripts_test.py --from 1 --to 5 --states 10 --iterations 1
+# Apply migration scripts across random state databases (1 per MySQL server, 7 total)
+python test_scripts/run_database_scripts_test.py --from 1 --to 5 --states 7 --iterations 1
 ```
 
 ## 5️⃣ Verify API Functionality

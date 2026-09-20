@@ -1,19 +1,19 @@
 """Randomized database_scripts test harness for distributed per-state SQL servers.
 
-Applies every script in a database_scripts folder range (e.g. 1 to 5) to a
-random sample of state tables, in parallel across states, using only the
-existing Flask API (POST /api/auth/login, POST /api/sql/execute) which routes
-to each state's dedicated MySQL server (e.g. mysql-maharashtra) - no direct
-database access. Scripts are applied in order; execution stops at the first
-failure for a given state so that later scripts (which may depend on it) are
-not attempted.
+Applies every script in a database_scripts folder range (e.g. 1 to 5) to 7 random
+state databases (1 state selected at random from each of the 7 SQL servers), in
+parallel across servers, using only the existing Flask API (POST /api/auth/login,
+POST /api/sql/execute) which routes to each state's assigned MySQL server
+(mysql-1 .. mysql-7) - no direct database access. Scripts are applied in order;
+execution stops at the first failure for a given state so that later scripts
+(which may depend on it) are not attempted.
 
 This is a plain script for local/manual testing only - it is not deployed as
 a container, Job, or Pod.
 
 Usage:
     python test_scripts/run_database_scripts_test.py --from 1 --to 5
-    python test_scripts/run_database_scripts_test.py --from 1 --to 10 --states 15 --iterations 3
+    python test_scripts/run_database_scripts_test.py --from 1 --to 10 --states 7 --iterations 3
 
 Configuration (environment variables, or the project's root .env):
     API_BASE_URL     Base URL of the running API (default http://localhost:5000)
@@ -29,6 +29,7 @@ import os
 import random
 import sys
 import threading
+from collections import defaultdict
 from pathlib import Path
 
 import requests
@@ -39,7 +40,7 @@ SCRIPTS_ROOT = PROJECT_ROOT / "database_scripts"
 load_dotenv(PROJECT_ROOT / ".env")
 
 sys.path.insert(0, str(PROJECT_ROOT / "app"))
-from state_populations import STATE_POPULATIONS  # noqa: E402
+from state_populations import STATE_POPULATIONS, STATE_SERVER_MAP  # noqa: E402
 
 LOGS_DIR = PROJECT_ROOT / "logs"
 LOGS_DIR.mkdir(exist_ok=True)
@@ -154,24 +155,40 @@ def run_scripts_for_state(client, database, state_code, scripts):
     return state_code, applied, errors
 
 
+def select_random_state_per_server(server_count=7):
+    """Select 1 random state database from each of the distinct MySQL servers.
+
+    Groups the 28 states by their assigned MySQL server (mysql-1 .. mysql-7),
+    samples `server_count` distinct servers, and picks 1 random state per server.
+    """
+    server_groups = defaultdict(list)
+    for state_code, server_name in STATE_SERVER_MAP.items():
+        server_groups[server_name].append(state_code)
+
+    available_servers = sorted(server_groups.keys())
+    if server_count > len(available_servers):
+        raise ValueError(
+            f"--states {server_count} exceeds available MySQL servers ({len(available_servers)})"
+        )
+
+    selected_servers = random.sample(available_servers, server_count)
+    return [random.choice(server_groups[srv]) for srv in selected_servers]
+
+
 def run_iteration(client, database, from_folder, to_folder, state_sample_size):
-    """Apply all scripts in the folder range to a fresh random state sample.
+    """Apply all scripts in the folder range to 1 random state DB per selected server.
 
     Always waits for every state's thread to finish before returning, even if
     some states fail; returns True only if every state completed cleanly.
     """
     scripts = discover_scripts(from_folder, to_folder)
-    available_states = list(STATE_POPULATIONS.keys())
-    if state_sample_size > len(available_states):
-        raise ValueError(
-            f"--states {state_sample_size} exceeds the {len(available_states)} available states"
-        )
-    states = random.sample(available_states, state_sample_size)
+    states = select_random_state_per_server(state_sample_size)
     logger.info(
-        "Folders %s-%s (%d scripts) against states: %s",
+        "Folders %s-%s (%d scripts) against %d state(s) (1 DB per server): %s",
         from_folder,
         to_folder,
         len(scripts),
+        len(states),
         ", ".join(states),
     )
 
@@ -210,7 +227,7 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size):
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Apply a database_scripts folder range to random states in parallel.",
+        description="Apply a database_scripts folder range to random state DBs (1 per server) in parallel.",
     )
     parser.add_argument(
         "--from", dest="from_folder", type=int, required=True,
@@ -221,8 +238,8 @@ def parse_args():
         help="Last database_scripts folder number to run, e.g. 5",
     )
     parser.add_argument(
-        "--states", type=int, default=10,
-        help="Number of random states to test per iteration (default 10)",
+        "--states", type=int, default=7,
+        help="Number of servers/states to test per iteration (default 7, 1 DB per server)",
     )
     parser.add_argument(
         "--iterations", type=int, default=1,
