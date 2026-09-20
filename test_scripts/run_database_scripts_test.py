@@ -19,7 +19,7 @@ Configuration (environment variables, or the project's root .env):
     API_BASE_URL     Base URL of the running API (default http://localhost:5000)
     API_USERNAME     Login username for POST /api/auth/login (required)
     API_PASSWORD     Login password for POST /api/auth/login (required)
-    TEST_DATABASE    Database name passed to /api/sql/execute (default students_db)
+    TEST_DATABASE    Database name passed to /api/sql/execute (default students_db) 
 """
 
 import argparse
@@ -176,15 +176,16 @@ def select_random_state_per_server(server_count=7):
 
 
 def run_iteration(client, database, from_folder, to_folder, state_sample_size):
-    """Apply all scripts in the folder range to 1 random state DB per selected server.
+    """Apply all scripts in the folder range in parallel across 1 random state DB per selected server.
 
-    Always waits for every state's thread to finish before returning, even if
-    some states fail; returns True only if every state completed cleanly.
+    State DBs run concurrently in parallel threads, while scripts within each state DB
+    are applied strictly sequentially one at a time.
+    Returns True only if every state completed cleanly.
     """
     scripts = discover_scripts(from_folder, to_folder)
     states = select_random_state_per_server(state_sample_size)
     logger.info(
-        "Folders %s-%s (%d scripts) against %d state(s) (1 DB per server): %s",
+        "Folders %s-%s (%d scripts) against %d state(s) (1 DB per server, parallel): %s",
         from_folder,
         to_folder,
         len(scripts),
@@ -200,9 +201,6 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size):
             ): state_code
             for state_code in states
         }
-        # Iterate every future to completion (as_completed only yields once a
-        # future is done), so the next iteration never starts until every
-        # state's thread from this one has finished, success or failure.
         for future in concurrent.futures.as_completed(futures):
             state_code = futures[future]
             try:
@@ -220,14 +218,14 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size):
                     )
             except Exception:
                 iteration_ok = False
-                logger.exception("[%s] Thread raised unexpectedly", state_code)
+                logger.exception("[%s] Unexpected failure during script execution", state_code)
 
     return iteration_ok
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Apply a database_scripts folder range to random state DBs (1 per server) in parallel.",
+        description="Apply a database_scripts folder range to random state DBs (1 per server) in parallel, executing scripts sequentially per state.",
     )
     parser.add_argument(
         "--from", dest="from_folder", type=int, required=True,
