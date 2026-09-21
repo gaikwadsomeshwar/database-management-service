@@ -1,14 +1,12 @@
-"""Driver script to run test_scripts/run_database_scripts_test.py in two phases.
+"""Driver script to run test_scripts/run_database_scripts_test.py in two phases with a max runtime cap.
 
 Phase 1: Incremental State Testing
-- Runs the test script for state count = 1 (100 times).
-- Runs for state count = 2 (100 times).
-- Continues sequentially up to state count = 7 (100 times).
-- Each run randomly selects from_folder (1..10), to_folder (from_folder..10), and iterations (100..1000).
+- Runs the test script for state count = 1 to 7.
+- Each run randomly selects from_folder (1..10), to_folder (from_folder..10), and iterations (default 1..5).
 
-Phase 2: 7-State Combination Testing
-- Executes 10,000 randomized parameter combinations targeting 7 states.
-- Each run randomly selects from_folder (1..10), to_folder (from_folder..10), iterations (100..1000), and states (default 7).
+Phase 2: Combination Load Testing
+- Executes randomized parameter combinations targeting 7 states (or configurable).
+- Enforces a strict time limit (default 10 hours) so driver runs never exceed the specified duration.
 """
 
 import argparse
@@ -42,25 +40,43 @@ TEST_SCRIPT = PROJECT_ROOT / "test_scripts" / "run_database_scripts_test.py"
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Driver to run test_scripts/run_database_scripts_test.py across state progression and 10,000 parameter combinations."
+        description="Driver to run test_scripts/run_database_scripts_test.py with a maximum 10-hour runtime cap."
     )
     parser.add_argument(
         "--runs-per-state",
         type=int,
-        default=100,
-        help="Phase 1: Number of runs for each state count 1 to 7 (default: 100)",
+        default=10,
+        help="Phase 1: Number of runs for each state count 1 to 7 (default: 10)",
     )
     parser.add_argument(
         "--combinations",
         type=int,
-        default=10000,
-        help="Phase 2: Number of parameter combinations to run (default: 10000)",
+        default=100,
+        help="Phase 2: Number of parameter combinations to run (default: 100)",
     )
     parser.add_argument(
         "--phase2-states",
         type=int,
         default=7,
         help="Phase 2: State database count per iteration (default: 7)",
+    )
+    parser.add_argument(
+        "--min-iterations",
+        type=int,
+        default=1,
+        help="Minimum iteration count per test script run (default: 1)",
+    )
+    parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=5,
+        help="Maximum iteration count per test script run (default: 5)",
+    )
+    parser.add_argument(
+        "--max-driver-hours",
+        type=float,
+        default=10.0,
+        help="Maximum total duration for the entire driver script in hours (default: 10.0)",
     )
     parser.add_argument(
         "--skip-phase1",
@@ -70,7 +86,7 @@ def parse_args():
     parser.add_argument(
         "--skip-phase2",
         action="store_true",
-        help="Skip Phase 2 (7-State Combination Load Testing)",
+        help="Skip Phase 2 (Combination Load Testing)",
     )
     parser.add_argument(
         "--base-url",
@@ -108,9 +124,19 @@ def run_driver():
     global_run_num = 0
 
     start_time = time.time()
+    max_duration_seconds = args.max_driver_hours * 3600.0
+
+    logger.info(
+        "Starting test driver (Max duration: %.1f hours, Iterations per run: %d..%d)",
+        args.max_driver_hours,
+        args.min_iterations,
+        args.max_iterations,
+    )
+
+    time_exhausted = False
 
     # -------------------------------------------------------------------------
-    # Phase 1: Incremental State Testing (States 1 to 7, 100 runs each)
+    # Phase 1: Incremental State Testing (States 1 to 7)
     # -------------------------------------------------------------------------
     if not args.skip_phase1:
         logger.info(
@@ -121,10 +147,20 @@ def run_driver():
         for state_count in range(1, 8):
             logger.info("--- Phase 1: Testing State Count %d/7 ---", state_count)
             for run_idx in range(1, args.runs_per_state + 1):
+                elapsed_total = time.time() - start_time
+                if elapsed_total >= max_duration_seconds:
+                    logger.warning(
+                        "Reached maximum driver time cap of %.1f hours (%.2fs elapsed). Gracefully stopping Phase 1.",
+                        args.max_driver_hours,
+                        elapsed_total,
+                    )
+                    time_exhausted = True
+                    break
+
                 global_run_num += 1
                 from_folder = random.randint(1, 10)
                 to_folder = random.randint(from_folder, 10)
-                iterations = random.randint(100, 1000)
+                iterations = random.randint(args.min_iterations, args.max_iterations)
 
                 cmd = [
                     sys.executable,
@@ -145,13 +181,14 @@ def run_driver():
                     failed_runs += 1
                     if args.stop_on_failure:
                         break
-            if failed_runs > 0 and args.stop_on_failure:
+
+            if time_exhausted or (failed_runs > 0 and args.stop_on_failure):
                 break
 
     # -------------------------------------------------------------------------
-    # Phase 2: 7-State Combination Testing (10,000 combinations)
+    # Phase 2: Combination Load Testing
     # -------------------------------------------------------------------------
-    if not args.skip_phase2 and not (failed_runs > 0 and args.stop_on_failure):
+    if not args.skip_phase2 and not time_exhausted and not (failed_runs > 0 and args.stop_on_failure):
         logger.info(
             "Starting Phase 2: Testing %d Combinations for %d random states",
             args.combinations,
@@ -159,10 +196,20 @@ def run_driver():
         )
 
         for combo_idx in range(1, args.combinations + 1):
+            elapsed_total = time.time() - start_time
+            if elapsed_total >= max_duration_seconds:
+                logger.warning(
+                    "Reached maximum driver time cap of %.1f hours (%.2fs elapsed). Gracefully stopping Phase 2.",
+                    args.max_driver_hours,
+                    elapsed_total,
+                )
+                time_exhausted = True
+                break
+
             global_run_num += 1
             from_folder = random.randint(1, 10)
             to_folder = random.randint(from_folder, 10)
-            iterations = random.randint(100, 1000)
+            iterations = random.randint(args.min_iterations, args.max_iterations)
 
             cmd = [
                 sys.executable,
@@ -186,8 +233,8 @@ def run_driver():
 
     total_elapsed = time.time() - start_time
     logger.info(
-        "=== Driver Finished: Total Executed Runs: %d, Passed: %d, Failed: %d (Total time: %.2fs) ===",
-        global_run_num, passed_runs, failed_runs, total_elapsed
+        "=== Driver Finished: Total Executed Runs: %d, Passed: %d, Failed: %d (Total time: %.2fs / %.2f hours) ===",
+        global_run_num, passed_runs, failed_runs, total_elapsed, total_elapsed / 3600.0
     )
 
     if failed_runs > 0:

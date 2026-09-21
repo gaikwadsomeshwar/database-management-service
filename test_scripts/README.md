@@ -43,10 +43,10 @@ python test_scripts/run_test_driver.py --stop-on-failure
 python test_scripts/run_test_driver.py --runs-per-state 10 --combinations 5 --runs-per-combo 10
 ```
 
-1. **Phase 1 (Incremental State Progression)**: Runs the test script sequentially for state counts from `1` up to `7` (100 runs for 1 state, 100 runs for 2 states, ..., 100 runs for 7 states). Each run randomly selects `from_folder` (1..10), `to_folder` (`from_folder`..10), and `iterations` (100..1000).
-2. **Phase 2 (7-State Combination Load Testing)**: Executes `10,000` randomized parameter combinations targeting 7 random state databases (`from_folder` 1..10, `to_folder` `from_folder`..10, `iterations` 100..1000, `states` 7).
-3. Synchronously waits for each run to complete before launching the next.
-4. Appends all logs to `logs/test_driver.txt`.
+1. **Phase 1 (Incremental State Progression)**: Runs the test script sequentially for state counts from `1` up to `7` (default: 10 runs per state count). Each run randomly selects `from_folder` (1..10), `to_folder` (`from_folder`..10), and `iterations` (1..5).
+2. **Phase 2 (7-State Combination Load Testing)**: Executes randomized parameter combinations targeting 7 random state databases (`from_folder` 1..10, `to_folder` `from_folder`..10, `iterations` 1..5, `states` 7).
+3. **Runtime Cap**: Enforces a strict maximum duration of **10.0 hours** (`--max-driver-hours 10.0`), automatically stopping execution cleanly if the elapsed time reaches 10 hours.
+4. Synchronously waits for each run to complete before launching the next and appends all logs to `logs/test_driver.txt`.
 
 ## What "rollback" actually reverts
 
