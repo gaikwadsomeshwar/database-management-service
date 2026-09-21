@@ -35,18 +35,70 @@ in the Python environment running this script.
 
 ## Automated Test Driver (`run_test_driver.py`)
 
-Executes `run_database_scripts_test.py` in two distinct testing phases:
+The automated driver script executes `run_database_scripts_test.py` across two structured testing phases to evaluate API performance, database routing, and pod autoscaling (`hpa-reactive` vs `scaledobject-proactive`).
+
+### Architecture & Testing Phases
+
+1. **Phase 1 (Incremental State Progression)**:
+   - Tests system performance as concurrent server load increases.
+   - Runs state counts sequentially from `1` up to `7` (default: 10 runs for 1 state, 10 runs for 2 states, ..., 10 runs for 7 states).
+   - In each run, randomly selects `from_folder` (1..10), `to_folder` (`from_folder`..10), and `iterations` (`--min-iterations` to `--max-iterations`).
+
+2. **Phase 2 (7-State Combination Load Testing)**:
+   - Evaluates sustained load across all 7 SQL servers simultaneously.
+   - Executes randomized parameter combinations targeting 7 state databases in parallel.
+
+3. **Maximum Duration Cap (`--max-driver-hours`)**:
+   - Enforces a strict runtime limit (default: **10.0 hours**).
+   - The driver tracks total elapsed time and automatically stops execution cleanly when the cap is reached, logging final statistics.
+
+---
+
+### Command-Line Arguments
+
+| Flag                 | Default                 | Description                                                              |
+| -------------------- | ----------------------- | ------------------------------------------------------------------------ |
+| `--runs-per-state`   | `10`                    | Phase 1: Number of test runs for each state count (1 to 7)               |
+| `--combinations`     | `100`                   | Phase 2: Number of parameter combinations to execute                     |
+| `--phase2-states`    | `7`                     | Phase 2: Number of parallel state databases per run                      |
+| `--min-iterations`   | `1`                     | Minimum iteration count passed to `run_database_scripts_test.py` per run |
+| `--max-iterations`   | `5`                     | Maximum iteration count passed to `run_database_scripts_test.py` per run |
+| `--max-driver-hours` | `10.0`                  | Strict total time cap in hours before the driver gracefully stops        |
+| `--skip-phase1`      | `false`                 | Skip Phase 1 (Incremental State Progression)                             |
+| `--skip-phase2`      | `false`                 | Skip Phase 2 (Combination Load Testing)                                  |
+| `--base-url`         | `http://localhost:5000` | Target API base URL                                                      |
+| `--stop-on-failure`  | `false`                 | Immediately abort driver execution if any run fails                      |
+
+---
+
+### Usage Examples
 
 ```powershell
+# 1. Standard Run (Runs Phase 1 + Phase 2 with 1..5 iterations, finishing in ~1.5 - 2 hours)
 python test_scripts/run_test_driver.py
+
+# 2. Quick Smoke Test (~5 - 10 minutes)
+python test_scripts/run_test_driver.py --runs-per-state 2 --combinations 5 --min-iterations 1 --max-iterations 2
+
+# 3. Overnight Benchmark with 10-Hour Hard Cap
+python test_scripts/run_test_driver.py --runs-per-state 20 --combinations 200 --max-driver-hours 10.0
+
+# 4. Phase 1 Only (Test state progression from 1 to 7 servers)
+python test_scripts/run_test_driver.py --skip-phase2 --runs-per-state 15
+
+# 5. Phase 2 Only (Full 7-server concurrent load test)
+python test_scripts/run_test_driver.py --skip-phase1 --combinations 150 --phase2-states 7
+
+# 6. Abort on First Failure (Useful for CI/CD or debugging)
 python test_scripts/run_test_driver.py --stop-on-failure
-python test_scripts/run_test_driver.py --runs-per-state 10 --combinations 5 --runs-per-combo 10
 ```
 
-1. **Phase 1 (Incremental State Progression)**: Runs the test script sequentially for state counts from `1` up to `7` (default: 10 runs per state count). Each run randomly selects `from_folder` (1..10), `to_folder` (`from_folder`..10), and `iterations` (1..5).
-2. **Phase 2 (7-State Combination Load Testing)**: Executes randomized parameter combinations targeting 7 random state databases (`from_folder` 1..10, `to_folder` `from_folder`..10, `iterations` 1..5, `states` 7).
-3. **Runtime Cap**: Enforces a strict maximum duration of **10.0 hours** (`--max-driver-hours 10.0`), automatically stopping execution cleanly if the elapsed time reaches 10 hours.
-4. Synchronously waits for each run to complete before launching the next and appends all logs to `logs/test_driver.txt`.
+---
+
+### Logging & Diagnostics
+
+- The driver appends comprehensive logs to `logs/test_driver.txt` including execution times, parameters, and pass/fail status per run.
+- Individual script details are logged simultaneously to `logs/test_script.txt`.
 
 ## What "rollback" actually reverts
 
