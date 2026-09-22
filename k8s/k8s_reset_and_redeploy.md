@@ -76,6 +76,9 @@ curl http://localhost:5000/health
 curl -X POST http://localhost:5000/api/sql/execute \
      -H "Content-Type: application/json" \
      -d '{"database":"students_db","sql":"SELECT COUNT(*) FROM student_maharashtra;","state":"maharashtra"}'
+
+# Verify active autoscaling mode (Reactive vs Proactive)
+kubectl get hpa,scaledobject
 ```
 
 ## 6️⃣ Updating & Rolling Out Code Changes

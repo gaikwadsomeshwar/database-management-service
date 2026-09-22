@@ -318,6 +318,31 @@ kubectl port-forward service/student-api 5000:5000
 
 The API is now available at `http://localhost:5000`.
 
+## Checking Active Autoscaling Mode (Reactive vs. Proactive)
+
+To verify which autoscaling mode is currently active in your cluster:
+
+```powershell
+kubectl get hpa,scaledobject
+```
+
+- **Proactive Scaling (KEDA)**: `scaledobject.keda.sh/student-api-scaledobject-proactive` will show `READY = True` and `ACTIVE = True`. Pods scale based on `forecast-service` ML predictions.
+- **Reactive Scaling (HPA)**: `horizontalpodautoscaler.autoscaling/student-api-hpa-reactive` will list CPU targets (e.g., `15%/80%`). Pods scale when CPU crosses 80%.
+
+To switch scaling modes:
+
+```powershell
+# Switch to Proactive (KEDA)
+kubectl delete -f k8s/hpa-reactive.yaml
+kubectl apply -f k8s/scaledobject-proactive.yaml
+
+# Switch to Reactive (HPA Baseline)
+kubectl delete -f k8s/scaledobject-proactive.yaml
+kubectl apply -f k8s/hpa-reactive.yaml
+```
+
+Alternatively, open the real-time autoscaling comparison dashboard at `http://localhost:5000/dashboard`.
+
 ## Clean up Kubernetes deployment
 
 ```powershell
