@@ -41,23 +41,23 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 │   └── secret.yaml             # local only; ignored by Git
 ├── test_scripts/
 │   ├── run_database_scripts_test.py # Parallel test harness routing SQL across state servers (max 7 states)
-│   ├── run_test_driver.py      # Automated two-phase test driver (1..7 states progression + 100 combinations load test)
-│   └── collect_pod_logs.py     # Collects pod logs (including all state MySQL pods)
+│   ├── run_test_driver.py      # Automated 340-run test driver (140 state progression runs + 200 parallel 7-server combos)
+│   └── collect_pod_logs.py     # Collects pod logs across student-api, mysql-1..mysql-7, forecast-service, prometheus
 ├── Dockerfile
 └── requirements.txt
 ```
 
 ## Distributed Consolidated SQL Architecture
 
-Instead of hosting 28 separate standalone MySQL containers or a single monolithic pod, the architecture consolidates database workloads into **7 dedicated MySQL servers**:
+Instead of hosting 28 separate standalone MySQL containers or a single monolithic pod, the architecture consolidates database workloads into **7 dedicated MySQL servers** (`mysql-1` through `mysql-7`):
 
-1. **State Isolation**: Each Indian state has a dedicated database (`students_db_<state>`) distributed across 7 MySQL pods and ClusterIP Services (`mysql-1` through `mysql-7`, 4 states per server).
-2. **Resource Right-Sizing**: Each MySQL pod requests `60m CPU` and `240Mi RAM` (limits: `500m CPU`, `768Mi RAM`) with `--innodb-buffer-pool-size=128M`. All 7 pods reserve ~0.42 CPU cores and ~1.68 GB RAM, avoiding CPU spikes and running smoothly on developer machines and Minikube.
+1. **State Isolation**: Each Indian state has a dedicated database (`students_db_<state>`) distributed across 7 MySQL pods and ClusterIP Services (`mysql-1` through `mysql-7`, 4 state databases per server).
+2. **Resource Right-Sizing**: Each MySQL pod requests `60m CPU` and `240Mi RAM` (limits: `800m CPU`, `896Mi RAM`) with `--innodb-buffer-pool-size=96M`. All 7 pods reserve a total footprint of ~6.2 GB RAM and run smoothly on developer machines and Minikube.
 3. **Independent Storage**: Each MySQL server has its own 2Gi `PersistentVolumeClaim` (`mysql-data-1` through `mysql-data-7`).
 4. **Dynamic Routing**:
    - The Flask API (`app/api.py`) routes single-state queries (`/api/students?state=maharashtra`) directly to `mysql-4/students_db_maharashtra`.
    - Global queries (`/api/students` without `state`) execute parallel fan-out queries across all 28 state databases via `ThreadPoolExecutor` and aggregate the paginated results.
-   - The SQL executor (`app/sql_executor.py`) automatically detects table references like `student_maharashtra` to target the corresponding SQL server and database.
+   - The SQL executor (`app/sql_executor.py`) automatically detects table references like `student_maharashtra` to target the corresponding SQL server (`mysql-4`) and database (`students_db_maharashtra`).
 
 ## Proactive autoscaling forecast service
 
