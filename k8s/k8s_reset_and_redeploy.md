@@ -68,10 +68,18 @@ kubectl get pvc -l app.kubernetes.io/component=mysql
 # Activate virtual environment
 .\.venv\Scripts\activate
 
-# Apply migration scripts across random state databases (1 per MySQL server, max 7, parallel state execution)
+# Option A: Single migration test across random state databases (1 per MySQL server, max 7)
 python test_scripts/database_execution/run_database_scripts_test.py --from 1 --to 5 --states 7 --iterations 1
 
+# Option B: Local traffic replication & live autoscaling demonstration (15–20 minutes)
+python test_scripts/drivers/run_test_driver.py --runs-per-state 3 --combinations 15
+
+# Option C: 10-day comparative autoscaling evaluation (5 min accelerated simulation)
+python test_scripts/drivers/run_5day_autoscaling_driver.py --mode accelerated --day-duration-seconds 30
 ```
+
+> **Local Traffic Note**: Because Minikube runs locally without external user traffic, `run_test_driver.py` replicates client activity to generate real Prometheus metrics (`student_api_requests_total`). You do NOT need to leave your machine running for 10 days — a 15–20 minute run of `run_test_driver.py` or a 5-minute run of `run_5day_autoscaling_driver.py` is sufficient.
+
 
 ## 5️⃣ Verify API Functionality
 
