@@ -145,7 +145,8 @@ def parse_args():
     parser.add_argument("--horizon", type=int, default=10, help="Prediction horizon in steps")
     parser.add_argument("--seasonal-periods", type=int, default=60, help="Seasonal period length")
     parser.add_argument("--model-path", default=str(DEFAULT_MODEL_PATH), help="Path to save/load model")
-    parser.add_argument("--no-eval", action="store_true", help="Skip validation evaluation during training")
+    parser.add_argument("--eval", "--evaluate", dest="eval", action="store_true", default=True, help="Compute validation evaluation metrics (default: True)")
+    parser.add_argument("--no-eval", dest="eval", action="store_false", help="Skip validation evaluation during training")
     return parser.parse_args()
 
 
@@ -167,7 +168,7 @@ def main():
             history_points=args.history_points,
             seasonal_periods=args.seasonal_periods,
             save_path=model_path,
-            evaluate=not args.no_eval,
+            evaluate=args.eval,
         )
         print("\n[TRAINING COMPLETE]")
         print(f"Artifact Saved To : {model_path}")
