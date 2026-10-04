@@ -253,3 +253,75 @@ All execution outputs, telemetry logs, and benchmark reports are centralized in 
 | `logs/cluster_execution_report.json` | `cluster_execution/deploy_and_verify_cluster.py` | 7 MySQL and core service readiness status |
 | `logs/test_script.txt` | `database_execution/run_database_scripts_test.py` | Migration execution stream across 7 servers |
 | `logs/test_driver.txt` | `drivers/run_test_driver.py` | Progression and combination driver run history |
+
+---
+
+## 5. Autoscaler Selection Guide: Which Scaling Should Be Used?
+
+### Primary Recommendation: Proactive Autoscaling (`scaledobject-proactive.yaml`)
+
+👉 **Proactive Autoscaling with KEDA ScaledObject is the recommended default for production and sustained operations.**
+
+#### Architectural Justification:
+1. **Pre-Warming Lead Time**: Predicts traffic increases 15 minutes ahead and triggers pod scaling **180 seconds before peak traffic arrives**, eliminating the **95.0s to 180s reaction lag** inherent to CPU threshold observation.
+2. **Tail Latency Reduction**: Reduces peak burst latency ($p99$) by **86.9%** ($58.2\text{ ms}$ vs $445.8\text{ ms}$) under intense 120 RPS burst spikes.
+3. **Dual-Track Safety Arbiter**: $R = \max(R_{\text{forecast}}, R_{\text{queue}})$. Proactive mode does **not** sacrifice reactive safety. If an unpredicted flash crowd hits the system, the queue-depth safety net instantly scales out replicas without waiting for the next forecast model cycle.
+4. **Baseline Purpose of HPA**: Standard Kubernetes reactive HPA (`hpa-reactive.yaml`) is maintained in the repository strictly as an **experimental baseline** for comparative evaluation against the proposed proactive platform.
+
+#### Critical Constraint: Mutual Exclusivity
+> **CAUTION**: Never deploy `hpa-reactive.yaml` and `scaledobject-proactive.yaml` simultaneously against `student-api`. Doing so results in dual-controller flapping, conflicting replica calculations, and resource thrashing.
+
+#### Commands to Switch Between Autoscalers:
+```powershell
+# 1. Enable Proactive Scaling (Production Default)
+python test_scripts/cluster_execution/deploy_and_verify_cluster.py --action switch-autoscaler --autoscaler proactive
+
+# 2. Enable Reactive Scaling (Baseline Benchmark Mode)
+python test_scripts/cluster_execution/deploy_and_verify_cluster.py --action switch-autoscaler --autoscaler reactive
+```
+
+---
+
+## 6. How to Test Your App & Train/Run the Model
+
+### Step 1: Run Unit Tests
+```powershell
+python test_scripts/prototype_refinement/run_prototype_tests.py
+```
+Validates forecaster fitting, $R = \max(R_f, R_q)$ bounds, SQL statement safety parser, and JWT authentication (30 tests, 100% pass rate).
+
+### Step 2: Train the Forecasting Model
+```powershell
+# Train the EnsembleForecaster and evaluate MAE, RMSE, and MAPE:
+python app/train_model.py --train
+
+# Custom history length (e.g. 360 points) with validation split:
+python app/train_model.py --train --history-points 360 --evaluate
+```
+*Trained model artifacts are serialized to `models/ensemble_forecaster.joblib`.*
+
+### Step 3: Run Inference with the Trained Model
+```powershell
+# Generate predicted request rates and recommended replicas for the next 10 time steps:
+python app/train_model.py --predict --horizon 10
+
+# Train and predict in a single command:
+python app/train_model.py --train --predict --horizon 10
+```
+
+### Step 4: Run the Continuous Forecast Microservice
+```powershell
+$env:VERTICAL_SCALING_ENABLED="false"  # if running locally without K8s
+python app/forecast_service.py
+# In another terminal:
+Invoke-RestMethod http://localhost:5100/predict | ConvertTo-Json
+Invoke-RestMethod http://localhost:5100/metrics
+```
+
+### Step 5: Run the 10-Day Comparative Autoscaling Experiment
+```powershell
+# Accelerated virtual simulation (30 seconds per virtual day = 5 minutes total):
+python test_scripts/drivers/run_5day_autoscaling_driver.py --mode accelerated --day-duration-seconds 30
+```
+Runs 5 days with reactive HPA enabled, cleanly stops and records baseline metrics, then runs 5 days with proactive KEDA enabled, and produces a consolidated comparative synthesis report in `logs/5day_comparative_autoscaling_report.md`.
+

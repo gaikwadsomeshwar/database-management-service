@@ -486,3 +486,110 @@ python test_scripts/drivers/run_5day_autoscaling_driver.py --mode accelerated --
 
 For full documentation of command-line flags and architecture, refer to [`test_scripts/README.md`](test_scripts/README.md).
 
+---
+
+## Testing the Application, Training & Running the Forecasting Model
+
+### 1. How to Test the Application
+
+```powershell
+# A. Execute all 30 unit tests (fast, self-contained, 100% pass rate)
+python test_scripts/prototype_refinement/run_prototype_tests.py
+
+# B. Verify Kubernetes cluster manifests & 7 MySQL servers
+python test_scripts/cluster_execution/deploy_and_verify_cluster.py --action verify
+
+# C. Execute 340-run load testing suite (dry-run simulation in ~16s)
+python test_scripts/traffic_generation/run_traffic_suite_340.py --dry-run
+
+# D. Run the live REST API locally and query endpoints
+python app/api.py
+# In another terminal:
+Invoke-RestMethod http://localhost:5000/health
+Invoke-RestMethod http://localhost:5000/metrics
+```
+
+### 2. How to Train the Forecasting Model
+
+The prediction engine utilizes the **`EnsembleForecaster`** (`app/forecasting/model.py`), blending:
+- **Holt-Winters Exponential Smoothing** (`statsmodels`): captures trend and diurnal seasonality.
+- **Gradient-Boosted Decision Trees** (`scikit-learn`): captures non-linear relationships across autoregressive lag features (`LAG_FEATURES = (1, 2, 3, 6, 12)`).
+
+```powershell
+# Train the model and evaluate validation accuracy (MAE, RMSE, MAPE)
+python app/train_model.py --train
+
+# Custom training window (e.g. 360 points) with evaluation metrics
+python app/train_model.py --train --history-points 360 --evaluate
+```
+*Trained model artifacts are serialized to `models/ensemble_forecaster.joblib`.*
+
+### 3. How to Run the Trained Model
+
+```powershell
+# A. Standalone CLI Inference: Predict upcoming traffic and recommended replicas for next N steps
+python app/train_model.py --predict --horizon 10
+
+# B. End-to-End: Train, serialize, and predict in one command
+python app/train_model.py --train --predict --horizon 10
+
+# C. Run Continuous Forecast Microservice (exposing /predict and /metrics for KEDA)
+$env:VERTICAL_SCALING_ENABLED="false"  # if running locally without K8s
+python app/forecast_service.py
+# Query predictions in another terminal:
+Invoke-RestMethod http://localhost:5100/predict | ConvertTo-Json
+```
+
+---
+
+## Autoscaling Operations: What Scaling Should Be Used & How to Handle Both
+
+### Which Scaling Should Be Enabled?
+
+👉 **Proactive Autoscaling (`scaledobject-proactive.yaml`) should be enabled by default.**
+
+| Reason | Explanation |
+| :--- | :--- |
+| **Zero Cold-Start Lag** | Pre-warms replicas **180 seconds ahead** of demand surges, eliminating the **95–180s reaction lag** inherent to CPU-based HPA. |
+| **Superior Latency Profile** | Reduces peak tail latency ($p99$) by **86.9%** ($58.2\text{ ms}$ vs $445.8\text{ ms}$) with **100% SLO compliance**. |
+| **Built-In Reactive Safety Net** | Uses a **dual-track arbiter**: $R = \max(R_{\text{forecast}}, R_{\text{queue}})$. If an unpredicted flash crowd arrives, the in-flight queue depth signal instantly scales out pods without waiting for the next forecast cycle. |
+| **Baseline Role of HPA** | Reactive HPA (`hpa-reactive.yaml`) is maintained strictly as the **experimental baseline** for comparative benchmarks. |
+
+### Mutual Exclusivity Warning
+
+> **CRITICAL**: Never enable both `hpa-reactive.yaml` and `scaledobject-proactive.yaml` simultaneously against `student-api`. Running both triggers metric conflicts, controller fighting, and replica thrashing.
+
+### How to Switch Between Autoscalers
+
+#### Automated Switching (Recommended)
+```powershell
+# 1. Switch to Proactive Mode (KEDA + ML Forecaster - Production Default)
+python test_scripts/cluster_execution/deploy_and_verify_cluster.py --action switch-autoscaler --autoscaler proactive
+
+# 2. Switch to Reactive Mode (CPU HPA - Baseline Benchmark Mode)
+python test_scripts/cluster_execution/deploy_and_verify_cluster.py --action switch-autoscaler --autoscaler reactive
+```
+
+#### Manual Switching (`kubectl`)
+```powershell
+# Enable Proactive Mode:
+kubectl delete -f k8s/hpa-reactive.yaml --ignore-not-found
+kubectl apply -f k8s/scaledobject-proactive.yaml
+
+# Enable Reactive Baseline Mode:
+kubectl delete -f k8s/scaledobject-proactive.yaml --ignore-not-found
+kubectl apply -f k8s/hpa-reactive.yaml
+```
+
+### How to Verify Active Scaling Mode
+```powershell
+# 1. Check Kubernetes resources:
+kubectl get scaledobject,hpa
+
+# 2. Query live scaling status API:
+Invoke-RestMethod http://localhost:5000/api/scaling/status | ConvertTo-Json -Depth 3
+
+# 3. View live web dashboard:
+# Open http://localhost:5000/dashboard in your browser
+```
+

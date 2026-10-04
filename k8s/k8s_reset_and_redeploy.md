@@ -45,7 +45,13 @@ kubectl apply -f k8s/api.yaml
 kubectl apply -f k8s/forecast-config.yaml
 kubectl apply -f k8s/forecast-service.yaml
 kubectl apply -f k8s/monitoring.yaml
-kubectl apply -f k8s/hpa-reactive.yaml
+
+# Autoscaler Selection: Choose ONE of the following (NEVER apply both simultaneously!)
+# Option 1 (Recommended Production): Proactive KEDA Predictive Scaler
+kubectl apply -f k8s/scaledobject-proactive.yaml
+
+# Option 2 (Experimental Baseline Only): Reactive CPU HPA
+# kubectl apply -f k8s/hpa-reactive.yaml
 ```
 
 ## 3️⃣ Verify Deployment
@@ -147,3 +153,46 @@ kubectl exec $pod -- python -c "import sql_executor; print(sql_executor.FORBIDDE
 | Old code still running after rollout              | Docker used cached layers with stale files     | Rebuild with `--no-cache`                                |
 | Old code still running after `--no-cache` rebuild | Minikube has old image cached under same tag   | `minikube ssh -- "docker rmi ... --force"` then reload   |
 | Swagger `/static/swagger.json` 404                | Stale pod; code fix not deployed yet           | Follow this rollout procedure                            |
+
+---
+
+## 7️⃣ Autoscaler Mode Management (Proactive vs Reactive)
+
+> [!WARNING]
+> **MUTUAL EXCLUSIVITY REQUIRED**:  
+> `k8s/hpa-reactive.yaml` and `k8s/scaledobject-proactive.yaml` MUST NEVER run at the same time against `student-api`. Because both controllers target the same deployment's replica count using different signals (CPU threshold vs ML predicted replicas), running both concurrently causes **control loop flapping and replica thrashing**.
+
+### Which Autoscaling Mode Should You Enable?
+
+| Autoscaling Mode | Manifest | Production Status | Use Case & Strengths |
+| :--- | :--- | :--- | :--- |
+| **Proactive Scaling (Default & Recommended)** | `k8s/scaledobject-proactive.yaml` | **Active / Production** | Pre-warms pods **3 minutes ahead** of traffic arrivals via ML forecasting (`predicted_replicas`), completely preventing cold-start burst latencies. It also contains an in-flight queue-depth reactive fallback arbiter ($R = \max(R_f, R_q)$) for unexpected traffic spikes. |
+| **Reactive Scaling (Baseline Only)** | `k8s/hpa-reactive.yaml` | **Baseline Evaluation Only** | CPU-threshold (>80% of 100m) HPA. Reacts only after CPU spikes, experiencing ~95s lead time delay during traffic surges. Maintained strictly for comparative benchmark experiments. |
+
+### How to Switch Autoscaling Modes
+
+#### Method A: Automated Switching via Cluster Execution Tool
+```powershell
+# Activate virtual environment
+.\.venv\Scripts\activate
+
+# Switch to Proactive KEDA (Default Production)
+python test_scripts/cluster_execution/deploy_and_verify_cluster.py --action switch-autoscaler --autoscaler proactive
+
+# Switch to Reactive HPA (Baseline Testing)
+python test_scripts/cluster_execution/deploy_and_verify_cluster.py --action switch-autoscaler --autoscaler reactive
+```
+
+#### Method B: Manual Switching via `kubectl`
+```powershell
+# --- Switch to Proactive Mode ---
+kubectl delete hpa student-api-hpa --ignore-not-found=true
+kubectl apply -f k8s/scaledobject-proactive.yaml
+kubectl get scaledobject,hpa
+
+# --- Switch to Reactive Baseline Mode ---
+kubectl delete scaledobject student-api-scaler --ignore-not-found=true
+kubectl apply -f k8s/hpa-reactive.yaml
+kubectl get hpa
+```
+
