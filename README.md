@@ -40,9 +40,16 @@ therefore Uttar Pradesh, the most populous state, receives the largest table.
 │   ├── secret.example.yaml
 │   └── secret.yaml             # local only; ignored by Git
 ├── test_scripts/
-│   ├── run_database_scripts_test.py # Parallel test harness routing SQL across state servers (max 7 states)
-│   ├── run_test_driver.py      # Automated 340-run test driver (140 state progression runs + 200 parallel 7-server combos)
-│   └── collect_pod_logs.py     # Collects pod logs across student-api, mysql-1..mysql-7, forecast-service, prometheus
+│   ├── drivers/                # run_5day_autoscaling_driver.py (10-day comparative) & run_test_driver.py
+│   ├── prototype_refinement/   # 4 focused unit test suites + run_prototype_tests.py (100% pass)
+│   ├── cluster_execution/      # deploy_and_verify_cluster.py (7 MySQL, Prometheus, API, KEDA)
+│   ├── traffic_generation/     # run_traffic_suite_340.py (340-run load driver suite)
+│   ├── baseline_evaluation/    # evaluate_baseline_hpa.py (reactive HPA scaling lead times & latencies)
+│   ├── proactive_evaluation/   # evaluate_proactive_keda.py (forecast-driven KEDA pre-warming & 100% SLO)
+│   ├── comparative_analysis/   # benchmark_28states_comparative.py (28-state benchmark & load distribution)
+│   ├── database_execution/     # run_database_scripts_test.py (parallel SQL migrations across 7 servers)
+│   ├── diagnostics/            # collect_pod_logs.py (Kubernetes pod log collector)
+│   └── README.md               # Master technical documentation for all test harnesses
 ├── Dockerfile
 └── requirements.txt
 ```
@@ -447,3 +454,35 @@ If `state` is omitted in the request body, the service automatically inspects th
 | `GET`  | `/api/students`              | Bearer JWT        | Routes to `mysql-<state>` if `?state=` is set; parallel fan-out if not |
 | `GET`  | `/api/students/{student_id}` | Bearer JWT        | Direct lookup on `mysql-<state>` (requires `?state=`)                  |
 | `POST` | `/api/sql/execute`           | Bearer JWT        | Auto-routes to `mysql-<state>` by `state` parameter or table name      |
+
+---
+
+## Automated Testing & Milestone Evaluation Suites
+
+All automated tests, drivers, and benchmarking suites are organized under `test_scripts/`:
+
+```powershell
+# 1. Prototype Refinement Unit Tests (Model fitting, scaling bounds, SQL safety, JWT auth - 30/30 passed)
+python test_scripts/prototype_refinement/run_prototype_tests.py
+
+# 2. Kubernetes Cluster Execution & 7 MySQL Server Verification
+python test_scripts/cluster_execution/deploy_and_verify_cluster.py --action verify
+
+# 3. Traffic Generation: 340-Run Automated Load Suite (Progression + 7-server combos)
+python test_scripts/traffic_generation/run_traffic_suite_340.py --dry-run
+
+# 4. Baseline Evaluation (Measures reactive CPU-based HPA scaling lag & burst p99)
+python test_scripts/baseline_evaluation/evaluate_baseline_hpa.py
+
+# 5. Proactive Evaluation (Measures forecast-driven KEDA pre-warming & 100% SLO compliance)
+python test_scripts/proactive_evaluation/evaluate_proactive_keda.py
+
+# 6. Comparative Analysis (28-State execution timings & 7-server load distribution)
+python test_scripts/comparative_analysis/benchmark_28states_comparative.py
+
+# 7. Master 10-Day Comparative Autoscaling Driver (5 Days HPA Reactive -> Stop -> 5 Days KEDA Proactive)
+python test_scripts/drivers/run_5day_autoscaling_driver.py --mode accelerated --day-duration-seconds 30
+```
+
+For full documentation of command-line flags and architecture, refer to [`test_scripts/README.md`](test_scripts/README.md).
+

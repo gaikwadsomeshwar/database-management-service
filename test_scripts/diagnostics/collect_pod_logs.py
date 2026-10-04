@@ -3,12 +3,12 @@
 A plain Python script for manual/local debugging - it is not deployed as a
 container, Job, or Pod. Wraps `kubectl logs` (current and, where available,
 `--previous` for crashed containers) for each known component and writes one
-file per component under `logs/`, collecting logs from all 28 per-state MySQL pods
+file per component under `logs/`, collecting logs from all 7 per-state MySQL pods
 into `logs/mysql.txt`, `student-api`'s errors into `logs/student-api.txt`, etc.
 
 Usage:
-    python test_scripts/collect_pod_logs.py
-    python test_scripts/collect_pod_logs.py --namespace default --tail 500
+    python test_scripts/diagnostics/collect_pod_logs.py
+    python test_scripts/diagnostics/collect_pod_logs.py --namespace default --tail 500
 """
 
 import argparse
@@ -18,7 +18,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+# Resolve project root (two levels up from diagnostics folder)
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LOGS_DIR = PROJECT_ROOT / "logs"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")

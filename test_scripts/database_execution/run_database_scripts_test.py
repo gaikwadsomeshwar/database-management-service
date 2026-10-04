@@ -12,8 +12,8 @@ This is a plain script for local/manual testing only - it is not deployed as
 a container, Job, or Pod.
 
 Usage:
-    python test_scripts/run_database_scripts_test.py --from 1 --to 5
-    python test_scripts/run_database_scripts_test.py --from 1 --to 10 --states 7 --iterations 3
+    python test_scripts/database_execution/run_database_scripts_test.py --from 1 --to 5
+    python test_scripts/database_execution/run_database_scripts_test.py --from 1 --to 10 --states 7 --iterations 3
 
 Configuration (environment variables, or the project's root .env):
     API_BASE_URL     Base URL of the running API (default http://localhost:5000)
@@ -35,7 +35,7 @@ from pathlib import Path
 import requests
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SCRIPTS_ROOT = PROJECT_ROOT / "database_scripts"
 load_dotenv(PROJECT_ROOT / ".env")
 
@@ -82,7 +82,6 @@ class ApiClient:
     def __init__(self, base_url, username, password, timeout=600):
         self.base_url = base_url.rstrip("/")
         self.timeout = timeout
-
 
         self._username = username
         self._password = password
@@ -191,7 +190,6 @@ def select_top_populous_state_per_server(server_count=7):
     ]
 
 
-
 def run_iteration(client, database, from_folder, to_folder, state_sample_size, explicit_states=None, top_populous=False):
     """Apply all scripts in the folder range in parallel across 1 state DB per selected server.
 
@@ -232,7 +230,6 @@ def run_iteration(client, database, from_folder, to_folder, state_sample_size, e
             len(states),
             ", ".join(states),
         )
-
 
     iteration_ok = True
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(states)) as executor:
@@ -303,7 +300,6 @@ def parse_args():
         default=int(os.getenv("API_TIMEOUT", "600")),
         help="HTTP request timeout in seconds for API requests (default 600)",
     )
-
     parser.add_argument(
         "--top-populous",
         action="store_true",
@@ -334,7 +330,6 @@ def main():
     try:
         client = ApiClient(args.base_url, username, password, timeout=args.timeout)
     except requests.RequestException:
-
         logger.exception("Login failed against %s", args.base_url)
         return 1
 
@@ -349,9 +344,7 @@ def main():
                 args.states, explicit_states=explicit_states, top_populous=args.top_populous
             ):
                 any_failures = True
-
         except Exception:
-            # Keep going: a bad iteration shouldn't stop the remaining ones.
             any_failures = True
             logger.exception("Iteration %d failed", iteration)
 

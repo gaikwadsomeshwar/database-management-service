@@ -1,4 +1,4 @@
-"""Driver script to run test_scripts/run_database_scripts_test.py in two phases with a max runtime cap.
+"""Driver script to run test_scripts/database_execution/run_database_scripts_test.py in two phases with a max runtime cap.
 
 Phase 1: Incremental State Testing
 - Runs the test script for state count = 1 to 7.
@@ -7,6 +7,10 @@ Phase 1: Incremental State Testing
 Phase 2: Combination Load Testing
 - Executes randomized parameter combinations targeting 7 states (or configurable).
 - Enforces a strict time limit (default 10 hours) so driver runs never exceed the specified duration.
+
+Usage:
+    python test_scripts/drivers/run_test_driver.py
+    python test_scripts/drivers/run_test_driver.py --runs-per-state 2 --combinations 5
 """
 
 import argparse
@@ -19,7 +23,7 @@ import time
 from pathlib import Path
 from dotenv import load_dotenv
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 load_dotenv(PROJECT_ROOT / ".env")
 
 LOGS_DIR = PROJECT_ROOT / "logs"
@@ -35,12 +39,15 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TEST_SCRIPT = PROJECT_ROOT / "test_scripts" / "run_database_scripts_test.py"
+# Primary location in database_execution, fallback to legacy test_scripts root
+_PRIMARY_SCRIPT = PROJECT_ROOT / "test_scripts" / "database_execution" / "run_database_scripts_test.py"
+_FALLBACK_SCRIPT = PROJECT_ROOT / "test_scripts" / "run_database_scripts_test.py"
+TEST_SCRIPT = _PRIMARY_SCRIPT if _PRIMARY_SCRIPT.exists() else _FALLBACK_SCRIPT
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Driver to run test_scripts/run_database_scripts_test.py with a maximum 10-hour runtime cap."
+        description="Driver to run test_scripts/database_execution/run_database_scripts_test.py with a maximum runtime cap."
     )
     parser.add_argument(
         "--runs-per-state",
