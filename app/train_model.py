@@ -177,7 +177,7 @@ def main():
             print(f"Validation MAPE   : {metrics['MAPE_pct']}%")
 
     if args.predict:
-        predictions = load_and_predict(horizon=args.horizon, model_path=model_path)
+        predictions = load_and_predict(horizon=args.horizon, model_path=model_path)     
         print(f"\n[INFERENCE RESULTS - NEXT {args.horizon} HORIZON STEPS]")
         print(f"{'Step':<8} {'Predicted Rate (req/s)':<25} {'Recommended Replicas':<20}")
         print("-" * 55)
